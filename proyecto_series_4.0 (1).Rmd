@@ -1,6 +1,6 @@
 ---
 title: "Proyecto Series 4.0"
-author: "Sofía Bocker"
+author: "Grupo 6"
 date: "2025-11-22"
 output: html_document
 ---
