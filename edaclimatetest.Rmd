@@ -1,0 +1,212 @@
+---
+title: "edaclimatetest"
+author: "Naydelin Hernandez Vargas, C03795"
+date: "2025-10-12"
+output: html_document
+---
+```{r}
+# install.packages(c("tidyverse", "lubridate", "janitor", "skimr", "patchwork"))
+
+library(tidyverse)   
+library(lubridate)   
+library(janitor)     # Limpieza de nombres de columnas
+library(skimr)       # Estadísticas descriptivas rápidas
+library(GGally)      # Correlaciones gráficas
+library(patchwork)   # Composición de gráficos
+
+datos<- "C:/Users/nayde/OneDrive/Desktop/Series de tiempo/anteproyecto/DailyDelhiClimateTest.csv"
+
+```
+
+```{r}
+clima <- read_delim(
+  datos,
+  delim = ";",
+  locale = locale(decimal_mark = ".", grouping_mark = ","),
+  show_col_types = FALSE
+) |> clean_names()   # los pone en minuscula y sin espacios
+
+
+glimpse(clima)
+```
+
+```{r}
+clima <- clima |>
+  mutate(date = dmy(date)) |>  #acomodar fecha 
+  arrange(date)                # Ordenen cronolgico
+
+summary(clima$date)
+
+```
+
+## Na, fechas duplicadas, rango de fechas 
+```{r}
+# NA por variable
+clima |> summarise(across(everything(), ~sum(is.na(.)))) 
+
+# fechas duplicadas
+clima |>
+  count(date) |>
+  filter(n > 1)
+
+# Rango temporal
+range(clima$date)
+```
+## data resumen
+```{r}
+skim(clima)
+
+# Resumen rapido que hace skim
+clima |>
+  summarise(
+    n = n(),
+    across(where(is.numeric),
+           list(
+             min = min,
+             q25 = ~quantile(.x, .25),
+             mean = mean,
+             med = median,
+             q75 = ~quantile(.x, .75),
+             max = max,
+             sd = sd
+           ),
+           .names = "{.col}_{.fn}")
+  ) |>
+  pivot_longer(-n, names_to = "stat", values_to = "value")
+```
+```{r}
+num_vars <- c("meantemp","humidity","wind_speed","meanpressure")
+
+# Función que marca TRUE si un valor está fuera del rango intercuartílico (1.5*IQR)
+is_outlier <- function(x){
+  q1 <- quantile(x, .25, na.rm = TRUE)
+  q3 <- quantile(x, .75, na.rm = TRUE)
+  iqr <- q3 - q1
+  (x < q1 - 1.5*iqr) | (x > q3 + 1.5*iqr)
+}
+
+clima_flag <- clima |>
+  mutate(across(all_of(num_vars), is_outlier, .names = "{.col}_is_outlier"))
+
+# Mostrar registros que presentan algun outlier
+clima_flag |>
+  filter(if_any(ends_with("_is_outlier"), ~.x)) |>
+  select(date, all_of(num_vars))
+
+# Chequear presiones sospechosamente bajas
+clima |> filter(meanpressure < 900)
+```
+Se estan detectando posibles outliers, por ejemplo para la presion atmostfericalo normal ronda 1000–1025 hPa, por lo tanto la fecga 2017-01-01 hay definitivamente un valor atipico
+
+## Tendencias en el tiempo, visualizacion
+```{r}
+theme_set(theme_minimal(base_size = 12))  
+
+# Graficos individuales
+p_temp <- ggplot(clima, aes(date, meantemp)) +
+  geom_line(color = "firebrick") +
+  labs(title = "Temperatura media diaria", x = NULL, y = "°C")
+
+p_hum  <- ggplot(clima, aes(date, humidity)) +
+  geom_line(color = "steelblue") +
+  labs(title = "Humedad relativa diaria", x = NULL, y = "%")
+
+p_wind <- ggplot(clima, aes(date, wind_speed)) +
+  geom_line(color = "darkgreen") +
+  labs(title = "Velocidad del viento diaria", x = NULL, y = "unidades")
+
+p_press <- ggplot(clima, aes(date, meanpressure)) +
+  geom_line(color = "purple") +
+  labs(title = "Presión media diaria", x = NULL, y = "hPa")
+
+(p_temp / p_hum) | (p_wind / p_press)
+```
+de nuevo en la presion se muestra el outlier antes identificado
+
+## Histogramas y boxplot
+```{r}
+p_hist <- function(var, xlab){
+  ggplot(clima, aes({{var}})) +
+    geom_histogram(bins = 25, fill = "skyblue", color = "white") +
+    labs(title = paste("Histograma de", xlab), x = xlab, y = "Frecuencia")
+}
+
+p_box <- function(var, ylab){
+  ggplot(clima, aes(y = {{var}})) +
+    geom_boxplot(fill = "lightgreen") +
+    labs(title = paste("Boxplot de", ylab), x = NULL, y = ylab)
+}
+
+#cambiar visualizacion
+(p_hist(meantemp,"meantemp") | p_box(meantemp,"meantemp")) /
+(p_hist(humidity,"humidity") | p_box(humidity,"humidity")) /
+(p_hist(wind_speed,"wind_speed") | p_box(wind_speed,"wind_speed")) /
+(p_hist(meanpressure,"meanpressure") | p_box(meanpressure,"meanpressure"))
+```
+## Correlaciones (pearson)
+```{r}
+clima_num <- clima |>
+  transmute(
+    `Temperatura media (°C)` = meantemp,
+    `Humedad relativa (%)`   = humidity,
+    `Velocidad del viento`   = wind_speed,
+    `Presión (hPa)`          = meanpressure
+  ) |>
+  mutate(`Presión (hPa)` = if_else(`Presión (hPa)` < 900, NA, `Presión (hPa)`))
+
+cor_mat <- cor(clima_num, use = "pairwise.complete.obs", method = "pearson")
+
+cor_df <- as.data.frame(cor_mat) |>
+  rownames_to_column("Var1") |>
+  pivot_longer(-Var1, names_to = "Var2", values_to = "r")
+
+ggplot(cor_df, aes(Var2, Var1, fill = r)) +
+  geom_tile() +
+  geom_text(aes(label = sprintf("%.2f", r)), size = 4) +  # etiqueta numérica
+  scale_fill_gradient2(
+    low = "steelblue3", mid = "white", high = "tomato",
+    midpoint = 0, limits = c(-1, 1), name = "r"
+  ) +
+  labs(title = "Matriz de correlaciones (Pearson)", x = NULL, y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = 0.5, size = 11),
+    axis.text.y = element_text(size = 11),
+    plot.title  = element_text(hjust = 0.5, face = "bold")
+  )
+```
+fuerte correlacion positiva entre la humedad relativa y la presión atmosférica, cuando la humedad aumenta, la presion tiende a hacerlo también.La temperatura media mantiene una fuerte correlación negativa con la humedad y la presiónes decir que los días mas calidos tienden a ser mas secos y con presiones ligeramente menores. La velocidad del viento tiene correlaciones debiles con todas las demas variables
+
+
+
+
+##Diagramas de dispersion
+```{r}
+g1 <- ggplot(clima, aes(meantemp, humidity)) +
+  geom_point(alpha = .6, color = "darkorange") +
+  geom_smooth(se = FALSE, method = "loess", color = "black") +
+  labs(title = "Temperatura vs Humedad", x = "meantemp (°C)", y = "humidity (%)")
+
+g2 <- ggplot(clima, aes(meantemp, wind_speed)) +
+  geom_point(alpha = .6, color = "darkcyan") +
+  geom_smooth(se = FALSE, method = "loess", color = "black") +
+  labs(title = "Temperatura vs Viento", x = "meantemp (°C)", y = "wind_speed")
+
+g3 <- ggplot(clima, aes(meantemp, meanpressure)) +
+  geom_point(alpha = .6, color = "brown") +
+  geom_smooth(se = FALSE, method = "loess", color = "black") +
+  labs(title = "Temperatura vs Presión", x = "meantemp (°C)", y = "meanpressure (hPa)")
+
+(g1 | g2) / g3
+```
+temperatura esta fuertemente asociada al comportamiento de la humedad, mientras que el viento y la presion muestran variaciones mas independientes.
+
+presion atmosferica se mantiene constante alrededor de 1000 hPa para todo el rango de temperaturas y se observa un punto aislado, que ya habia sido detectado
+```{r}
+# Crear una secuencia diaria completa (por si hay huecos) *sugerencia?
+fechas_completas <- tibble(date = seq(min(clima$date), max(clima$date), by = "day"))
+
+clima_daily <- fechas_completas |>
+  left_join(clima, by = "date")
+```
+

@@ -1,0 +1,588 @@
+---
+title: "Proyecto Series de Tiempo"
+author: "Sofía Bocker"
+output: html_document
+---
+
+```{r}
+library(astsa)
+library(dynlm) 
+library(tidyverse)
+library(readxl)
+library(forecast)
+ library(sandwich)
+library(lmtest)
+
+
+```
+
+```{r}
+# Base de datos
+df <- read_excel("base_desempleo.xlsx")
+```
+
+# Exploratorio
+
+```{r}
+to_ts <- function(v, start_year=2010, start_month=1) ts(v, start=c(start_year, start_month), frequency=12)
+
+x <- to_ts(df$`Tasa de desempleo`, 2010, 1)   # serie objetivo
+imae <- to_ts(df$IMAE, 2010, 1)
+ipc <- to_ts(df$IPC, 2010, 1)
+tc <- to_ts(df$`Tipo de cambio (promedio)`, 2010, 1)
+tbp <- to_ts(df$TBP, 2010, 1)
+ismr <- to_ts(df$ISMR, 2010, 1)
+
+plot(x, main="Desempleo: serie original", xlab="", ylab="%")
+```
+
+La variabilidad parece bastante constante (no hace falta transformar con log al ser % y no verse heterocedasticidad marcada)
+
+- 2010–2013: sube y baja, sin rumbo claro.
+- 2014–2017: se mantiene alrededor de 9–10%.
+- Desde 2018: salto claro de nivel a 11–12.5%: esto sugiere quiebre estructural (cambio de media).
+
+Estacionalidad: si existe, es débil a ojo, no se aprecia un patrón mensual repetitivo marcado.
+Atípicos: hay picos/caídas puntuales (ej. mínimos cerca de 2013 y picos en 2018–2019), pero lo más importante es el cambio de nivel en 2018. 
+
+Parece que la serie no es estacionaria en media (por ese quiebre en 2018)
+
+```{r}
+
+summary(fit <- lm(x ~ time(x), na.action=NULL))
+
+plot(x, ylab="Tasa desempleo")
+abline(fit)
+
+```
+
+- Pendiente (0.12055): indica un aumento promedio de 0.12 puntos porcentuales por año en la tasa de desempleo durante 2010–2020. Equivale a 0.01 p.p. por mes (0.12055/12 = 0.010). La pendiente es estadísticamente distinta de 0 (t=3.91, p=0.00016).
+- Intercepto (-232.94): proviene de la codificación del eje tiempo (años decimales desde 2010); no tiene interpretación sustantiva aquí.
+- Significancia global: el F=15.3 con p=0.00016 confirma que la recta con pendiente distinta de 0 se ajusta mejor que una media constante.
+- R² = 0.12 (ajustado 0.11): el tendencial lineal explica 12% de la variación total. La mayor parte de la variabilidad queda en los residuos.
+- Error estándar residual = 0.90 p.p.: el desvío típico alrededor de la recta es de 0.9 puntos porcentuales.
+
+La línea de tendencia es suave y ascendente, el gráfico muestra que hay periodos por encima y por debajo de esa recta (oscilaciones y cambios de nivel), por eso el R2 es modesto.
+
+Hay tendencia ascendente débil pero significativa, sin embargo, la dispersión alrededor de la recta es amplia, por lo que el componente lineal captura solo una fracción del comportamiento de la serie.
+
+
+```{r}
+fit <- lm(x ~ time(x), na.action = NULL)
+par(mfrow = c(2,1))
+plot(resid(fit), type="o", main="detrended")
+plot(diff(x), type="o", main="first difference")
+```
+
+- detrended (residuos del ajuste lineal): la serie queda centrada en 0, pero persisten oscilaciones de baja frecuencia (tramos largos por encima y por debajo de 0). Se distingue un cambio de nivel claro alrededor de 2018, con valores mayormente positivos después de ese punto. Esto sugiere que quitar solo la recta no elimina toda la dinámica lenta.
+
+- first difference (diff x): también centrada en 0, con picos puntuales (positivos y negativos) pero sin ondas largas; visualmente luce más estable en nivel y varianza. No se aprecia estacionalidad clara. Hay algunos saltos aislados (por ejemplo, cercanos a 2013 y 2018), pero la dispersión general es bastante acotada (= +-0.6 p.p.).
+
+el detrended conserva estructura de largo plazo y el posible salto de 2018, la primera diferencia se ve más como ruido, concentrada alrededor de 0 y sin patrón lento evidente.
+
+```{r}
+par(mfrow = c(3,1))
+acf(x, 48, main="desempleo")
+acf(resid(fit), 48, main="detrended")
+acf(diff(x), 48, main="first difference")
+```
+
+- Original (arriba): autocorrelaciones altas y positivas en lags cortos que decaen muy lentamente, típico de una serie no estacionaria o con componente de baja frecuencia. No se observan picos destacados en lags 12, 24… (no hay estacionalidad anual evidente).
+- Detrended (medio): al quitar la recta, la ACF baja, pero sigue un decaimiento gradual con varios lags aún significativos, persiste estructura de dependencia de mediano plazo.
+- Primera diferencia (abajo): la ACF se aproxima a cero rápidamente, salvo quizá algún lag muy corto, la mayoría de barras caen dentro de las bandas, lo que sugiere un proceso mucho más cercano a estacionario y sin patrón estacional visible.
+
+```{r}
+# para ver el último mejor
+acf(diff(x), 48, main="first difference")
+```
+
+```{r}
+lag1.plot(x, 12)  
+```
+
+- Persistencia fuerte en rezagos cortos: el panel t−1 muestra una nube muy alineada en diagonal ascendente con correlación = 0.88, en t−2 aún es alta (0.73) y en t−3 moderada (0.59). Esto indica memoria clara: valores altos (bajos) tienden a seguir a valores altos (bajos) en los meses siguientes.
+- Decaimiento progresivo: las correlaciones disminuyen conforme aumenta el rezago: alrededor de 0.52 (t−4), 0.47 (t−5), 0.42 (t−6), bajando hasta 0.18 en t−12. El patrón es consistente con lo visto en la ACF: dependencia que se va apagando gradualmente.
+- Forma casi lineal: la relación es principalmente lineal en los primeros rezagos, no se observan curvaturas marcadas ni formas en que sugieran no linealidades fuertes.
+- Sin señal estacional fuerte anual: el rezago 12 es débil (0.18), lo que respalda que no hay una repetición anual marcada en la serie.
+- Rango y dispersión: las nubes se ensanchan a medida que aumenta el rezago (más dispersión), coherente con menor poder predictivo conforme pasa el tiempo.
+
+Básicamente es una serie altamente persistente a corto plazo, con correlaciones que se atenúan hacia rezagos mayores y sin estacionalidad anual evidente.
+
+
+
+
+```{r}
+par(mfrow = c(2,3))
+acf(imae, 48, main="IMAE")
+acf(ipc, 48, main="IPC")
+acf(tc, 48, main="Tipo de Cambio")
+acf(tbp, 48, main="TBP")
+acf(ismr, 48, main="ISMR")
+```
+
+
+```{r}
+lag2.plot(x, imae, 8)  # imae vs desempleo
+lag2.plot(x, ipc, 8)  # ipc vs desempleo
+lag2.plot(x, tc, 8)  # tipo de cambio vs desempleo
+lag2.plot(x, tbp, 8)  # tbp vs desempleo
+lag2.plot(x, ismr, 8)  # ismr vs desempleo
+```
+
+IMAE vs desempleo
+
+El IMAE muestra una relación negativa clara con el desempleo: x(t) es el más fuerte (r=–0.35), y se mantiene negativa y significativa en términos prácticos en t–1 (–0.31) y t–2 (–0.24). A partir de t–3,…, t–8 la fuerza baja a débil–moderada (–0.12 a –0.18), pero la señal persiste. En todos los paneles hay alta dispersión (los puntos están bastante esparcidos), y la curva roja sugiere una leve no linealidad: para valores altos de desempleo la caída del IMAE se acentúa.
+
+Más actividad (IMAE alto) se asocia con menos desempleo en el mismo mes y en los 1–2 meses siguientes: el IMAE aporta señal útil contemporánea y de corto rezago para explicar la tasa de desempleo. Para un modelo con desempleo como dependiente, una opción es probar IMAE en t,t−1,t−2 (coeficientes esperados negativos) junto al AR del propio desempleo, rezagos mayores probablemente añaden ruido. Se puede trabajar con difflog(IMAE) (y desestacionalizado) y validar con CCF/AIC-BIC y diagnóstico de residuos.
+
+
+IPC vs desempleo
+
+El IPC frente al desempleo muestra correlación casi nula en todos los rezagos: los coeficientes están entre 0.02 y 0.04. La nube es muy dispersa y la línea roja cambia de pendiente levemente según el tramo (un amago de no linealidad alrededor de x≈10), pero no hay patrón robusto ni en t, t−1…t−8.
+
+el IPC no aporta señal útil para explicar la tasa de desempleo en el corto/mediano plazo: la inflación parece responder más a shocks de oferta, tipo de cambio o regulaciones que a la holgura del mercado laboral. De incluirlo, que sea solo como control y en variaciones (ej: diffIPC o núcleo), validando por AIC/BIC. Sino, es mejor priorizar predictores con señal clara.
+ 
+ 
+Tipo de cambio promedio vs desempleo
+
+El tipo de cambio (tc) vs desempleo muestra una relación positiva y no lineal en el corto plazo: el contemporáneo es moderado (r=0.39), y aún positivo en t–1 (0.32) y t–2 (0.24). Desde t–3 la fuerza cae rápido y se acerca a cero, volviéndose ligeramente negativa en t–6…t–8 (–0.08 a –0.12). La nube es muy dispersa y la curva roja sugiere un umbral: con desempleo <= 10% la relación es débil, pero >=10–10.5% el tipo de cambio sube con fuerza (posible efecto de régimen).
+
+La depreciación del colón (tc más alto) suele coincidir con más desempleo en el mismo mes y los 1–2 meses siguientes, co-movimiento típico en episodios de debilidad macro, choques externos o relajación monetaria. Para un modelo con desempleo como dependiente, se puede probar difflog(tc) en t, t–1, t–2 (signo esperado +) y manteniendo parsimonia, los rezagos >3 aportan poco o incluso cambian de signo. Dado el indicio de no linealidad/umbral, se puede considerar spline o una dummy de “tensión cambiaria” (p. ej., grandes depreciaciones) y controlar por IMAE y TBP para evitar sesgo por omitidos.
+
+
+TBP vs desempleo
+
+La TBP frente al desempleo muestra una correlación positiva y crecientemente más clara con el rezago: es muy débil en t, t−2 (r=0.05–0.10) y pasa a débil–moderada en t−4 a t−7 (r=0.15–0.17), donde la pendiente roja se inclina más. La nube de puntos sigue dispersa y la forma es no lineal: para desempleo bajo la relación es plana, y por encima de 10% la TBP más alta se asocia con más desempleo.
+
+Cuadra con la transmisión de política monetaria: tasas más altas tienden a enfriar la actividad y elevar el desempleo con rezago de varios meses. Para un modelo con desempleo como dependiente, la TBP aporta señal con rezagos medios. Se puede probar TBP t−4..TBP t−7 (signo esperado +) y dejar el contemporáneo en segundo plano. Se puede trabajar con cambios en la TBP (o desvíos respecto a tendencia) y validar su aporte con AIC/BIC y diagnóstico de residuos.
+
+
+ISMR vs desempleo
+
+El ISMR (salario mínimo real) y el desempleo muestran una relación negativa débil en el presente y corto plazo: r=−0.21 en t−0.17 en t−1 y −0.13 en t−2. Desde t−3 la señal se diluye (−0.07 a 0) y a partir de t−5 aparece una ligerísima positividad (0.02–0.05). La dispersión es alta en todos los paneles y la línea roja insinúa no linealidad suave. En general, el poder explicativo es bajo.
+
+Salarios mínimos reales algo más altos se asocian con menor desempleo contemporáneo/temprano, pero el efecto no es robusto y desaparece después de 2–3 meses—probablemente porque el ISMR está muy influido por ajustes regulatorios e inflación. Para un modelo con desempleo como variable dependiente, el ISMR podría entrar solo como control (en diff o difflog) y, si se incluye, limitarse a t−2 con signo esperado negativo. En términos de aporte predictivo, queda por debajo de IMAE, tipo de cambio y TBP.
+
+```{r}
+ccf(x, imae, lag.max = 8)  
+ccf(x, ipc, lag.max = 8)
+ccf(x, tc, lag.max = 8)
+ccf(x, tbp, lag.max = 8)
+ccf(x, ismr, lag.max = 8)
+```
+
+
+```{r}
+# Serie objetivo en primera diferencia (diff x)
+dx <- diff(x)     
+
+# Covariables en la misma lógica (diferencias mensuales)
+dimae <- diff(imae) 
+dtc <- diff(log(tc)) 
+dtbp <- diff(tbp) 
+dipc <- diff(ipc) 
+dismr <- diff(ismr)
+
+```
+
+```{r}
+
+lag1.plot(dx, 12)  
+
+
+```
+
+IMAE vs desempleo: señales débiles y mixtas (|r|<=0.24). El mayor r aparece en dx(t−5) (+0.24) y dx(t−6) (−0.22), lo que sugiere que diffu mueve a diffIMAE más que al revés a esos plazos. Conclusión: poca evidencia de que diffIMAE anticipe diffu en el corto plazo. Si aporta, será muy modesto y conviene confirmarlo con CCF.
+
+IPC vs desempleo: r’s muy pequeños (−0.09…+0.12), nube muy dispersa. Conclusión: no hay aporte práctico para explicar diffu.
+
+TPC vs desempleo: contemporáneo y t−2 cerca de +0.12, luego r negativos en t−5…t−7 (−0.22 a −0.18). De nuevo, esto apunta más a co-movimiento contemporáneo que a capacidad de liderar a diffu. Conclusión: quizá útil contemporáneo (y/o t−1, t−2), pero el poder predictivo en diff es débil.
+
+TBP vs desempleo: contemporáneo y t−2 cerca de +0.12, luego r negativos en t−5…t−7 (−0.22 a −0.18). De nuevo, esto apunta más a co-movimiento contemporáneo que a capacidad de liderar a diffu. Conclusión: quizá útil contemporáneo (y/o t−1, t−2), pero el poder predictivo en diff es débil.
+
+ISMR vs desempleo: r’s muy pequeños (−0.13…+0.11); nada robusto. Conclusión: usar solo como control, si acaso.
+
+```{r}
+ccf(dx, dimae, lag.max = 8)  
+ccf(dx, dipc, lag.max = 8)
+ccf(dx, dtc, lag.max = 8)
+ccf(dx, dtbp, lag.max = 8)
+ccf(dx, dismr, lag.max = 8)
+```
+
+```{r}
+imaeF <- imae
+ipcF <- ipc
+tcF <- diff(log(tc)) 
+tbpF <- diff(tbp)
+ismrF <- ismr
+```
+
+```{r}
+lag2.plot(dx, imaeF, 8)  # imae vs desempleo
+lag2.plot(dx, ipcF, 8)  # ipc vs desempleo
+lag2.plot(dx, tcF, 8)  # tipo de cambio vs desempleo
+lag2.plot(dx, tbpF, 8)  # tbp vs desempleo
+lag2.plot(dx, ismrF, 8)  # ismr vs desempleo
+```
+
+```{r}
+
+sig_lags_ccf <- function(y, x, max.lag = 12, name = "X") {
+  # Ajuste ARIMA a X para prewhitening
+  fitx <- auto.arima(x, seasonal = FALSE, stepwise = FALSE, approximation = FALSE)
+  # Extrae coeficientes AR si existen (para filtrar Y)
+  phi <- tryCatch(fitx$model$phi, error = function(e) NULL)
+
+  # Serie de X preblanqueada = residuales del ARIMA
+  rx <- residuals(fitx)
+
+  # Filtra Y con el mismo filtro AR (si hay phi); si no, deja Y igual
+  if (!is.null(phi) && length(phi) > 0) {
+    fy <- stats::filter(y, filter = phi, method = "convolution", sides = 1)
+  } else {
+    fy <- y
+  }
+
+  # CCF (lags > 0: X_{t-k} "lead" Y_t)
+  cc  <- ccf(fy, rx, lag.max = max.lag, plot = FALSE, na.action = na.omit)
+  lags <- as.numeric(cc$lag)
+  acfval <- as.numeric(cc$acf)
+  n <- sum(!is.na(acfval))
+  thr    <- 1.96 / sqrt(n)
+
+  keep <- which(abs(acfval) > thr & lags > 0)
+
+  if (length(keep) == 0) {
+    # <- caso sin lags significativos
+    return(data.frame(var = character(0), lag = integer(0),
+                      ccf = numeric(0), sig = character(0)))
+  }
+
+  out <- data.frame(
+    var  = name,
+    lag  = lags[keep],
+    ccf  = round(acfval[keep], 3),
+    sig  = ifelse(acfval[keep] > 0, "+", "−")
+  )
+  out[order(out$lag), ]
+}
+
+
+ #dx <- diff(desempleo)                  # y ya en diferencia
+ res_imae <- sig_lags_ccf(dx, imaeF, max.lag = 12, name = "IMAE")
+ res_ipc <- sig_lags_ccf(dx, ipcF, max.lag = 12, name = "IPC")
+ res_ismr <- sig_lags_ccf(dx, ismrF, max.lag = 12, name = "ISMR")
+ res_dtc <- sig_lags_ccf(dx, tcF, max.lag = 12, name = "dlogTC")
+ res_dtbp <- sig_lags_ccf(dx, tbpF, max.lag = 12, name = "dTBP")
+ results <- rbind(res_imae, res_ipc, res_ismr, res_dtc, res_dtbp)
+ results
+
+
+```
+
+
+
+```{r}
+ccf(dx, imaeF, lag.max=8)
+ccf(dx, ipcF, lag.max=8)
+ccf(dx, tcF, lag.max=8)
+ccf(dx, tbpF, lag.max=8)
+ccf(dx, ismrF, lag.max=8)
+
+```
+
+```{r}
+scan_lags_hac <- function(dx, z, max_lag = 8, name = "Z", hac_lag = 6){
+  out <- lapply(0:max_lag, function(L){
+    dat <- ts.intersect(dx = dx, zL = stats::lag(z, -L))
+    if(NROW(dat) > 10){
+      fit <- dynlm(dx ~ zL, data = as.data.frame(dat))
+      # Varianza robusta HAC (Newey-West)
+      V <- sandwich::NeweyWest(fit, lag = hac_lag, prewhite = FALSE, adjust = TRUE)
+      co  <- coeftest(fit, vcov.=V)
+      data.frame(
+        var  = name,
+        lag  = L,
+        beta = unname(co["zL","Estimate"]),
+        t = unname(co["zL","t value"]),
+        p = unname(co["zL","Pr(>|t|)"]),
+        R2 = summary(fit)$r.squared
+      )
+    } else data.frame(var=name, lag=L, beta=NA, t=NA, p=NA, R2=NA)
+  })
+  do.call(rbind, out)
+}
+
+ord <- function(df) df[order(-abs(df$t)), c("var","lag","beta","t","p","R2")]
+
+lags_imae <- scan_lags_hac(dx, imaeF, name="IMAE")
+lags_ipc <- scan_lags_hac(dx, ipcF, name="IPC")
+lags_ismr <- scan_lags_hac(dx, ismrF, name="ISMR")
+lags_tc <- scan_lags_hac(dx, tcF, name="dlogTC")
+lags_tbp  <- scan_lags_hac(dx, tbpF,name="dTBP")
+
+ord(lags_imae); ord(lags_tc); ord(lags_tbp); ord(lags_ipc); ord(lags_ismr)
+
+```
+
+```{r}
+library(forecast); library(dynlm)
+
+scan_lags_pw <- function(dx, z, max_lag=8, name="Z"){
+  fitx <- auto.arima(z, seasonal=FALSE, stepwise=FALSE, approximation=FALSE)
+  phi <- tryCatch(fitx$model$phi, error=function(e) NULL)
+  rz <- residuals(fitx)
+  dy_f <- if(length(phi)>0) stats::filter(dx, filter=phi, method="convolution", sides=1) else dx
+
+  out <- lapply(0:max_lag, function(L){
+    dat <- ts.intersect(dx = dy_f, rzL = stats::lag(rz, -L))
+    if(NROW(dat) > 10){
+      fit <- dynlm(dx ~ rzL, data=as.data.frame(dat))
+      s   <- summary(fit)
+      data.frame(var=name, lag=L,
+                 beta=unname(coef(fit)["rzL"]),
+                 t=unname(s$coefficients["rzL","t value"]),
+                 p=unname(s$coefficients["rzL","Pr(>|t|)"]),
+                 R2=s$r.squared)
+    } else data.frame(var=name, lag=L, beta=NA, t=NA, p=NA, R2=NA)
+  })
+  do.call(rbind, out)
+}
+
+ord <- function(df) df[order(-abs(df$t)), c("var","lag","beta","t","p","R2")]
+
+lags_imae <- scan_lags_pw(dx, imaeF, name="IMAE")
+lags_ipc <- scan_lags_pw(dx, ipcF,  name="IPC")
+lags_ismr <- scan_lags_pw(dx, ismrF, name="ISMR")
+lags_tc <- scan_lags_pw(dx, tcF,   name="dlogTC")
+lags_tbp  <- scan_lags_pw(dx, tbpF,  name="dTBP")
+
+ord(lags_imae); ord(lags_tc); ord(lags_tbp); ord(lags_ipc); ord(lags_ismr)
+
+```
+
+
+```{r}
+
+scan_lags <- function(dx, z, max_lag = 8, name = "Z"){
+  out <- lapply(0:max_lag, function(L){
+    dat <- ts.intersect(dx = dx, zL = stats::lag(z, -L))
+    if(NROW(dat) > 5){
+      mod <- dynlm(dx ~ zL, data = as.data.frame(dat))
+      co <- summary(mod)$coefficients
+      data.frame(
+        var = name,
+        lag = L,
+        beta = unname(co["zL","Estimate"]),
+        t = unname(co["zL","t value"]),
+        p = unname(co["zL","Pr(>|t|)"]),
+        R2 = summary(mod)$r.squared,
+        stringsAsFactors = FALSE
+      )
+    } else {
+      data.frame(var = name, lag = L, beta = NA_real_, t = NA_real_,
+                 p = NA_real_, R2 = NA_real_, stringsAsFactors = FALSE)
+    }
+  })
+  do.call(rbind, out)
+}
+
+# Escaneos
+lags_imae <- scan_lags(dx, imaeF, max_lag = 8, name = "IMAE")
+lags_tc <- scan_lags(dx, tcF, max_lag = 8, name = "TipoCambio")
+lags_tbp <- scan_lags(dx, tbpF, max_lag = 8, name = "TBP")
+lags_ipc <- scan_lags(dx, ipcF, max_lag = 8, name = "IPC")
+lags_ismr <- scan_lags(dx, ismrF, max_lag = 8, name = "ISMR")
+
+# Ordenadores 
+ord <- function(df) df[order(-abs(df$t), na.last = TRUE), c("var","lag","beta","t","p","R2")]
+ord(lags_imae); ord(lags_tc); ord(lags_tbp); ord(lags_ipc); ord(lags_ismr)
+
+```
+
+- IMAE: la mejor señal está en lag 1 (t = –2.17, p = 0.032, R2 = 4.1%). Hay indicios más débiles en lag 7 (p = 0.07). Cuando la actividad (IMAE) sube, al mes siguiente la variación del desempleo tiende a bajar (efecto “pro-cíclico” esperado).
+
+- TBP: la única señal borderline es lag 8 (t = 2.00, p = 0.048, R2 = 3.8%). Un endurecimiento de tasas hoy podría asociarse con aumentos en la variación del desempleo unos 8 meses después (mecánica de transmisión lenta).
+
+- Tipo de cambio: ningún rezago es significativo (p>0.19) y R2 muy bajo.
+
+- IPC: sin rezagos significativos (p>0.26) y R2 = 0.2–0.7%.
+
+- ISMR: sin rezagos significativos (p>0.65).
+
+```{r}
+X <- ts.intersect(
+  dx = dx,
+  # lo que salió significativo
+  IMAE_1 = stats::lag(imae, -1),  
+  TBP_8 = stats::lag(tbp,  -8)
+)
+y <- X[, "dx"]
+X1 <- X[, c("IMAE_1","TBP_8")]     
+
+```
+
+```{r}
+# sólo ARIMA 
+m0 <- auto.arima(y, seasonal = FALSE)        
+# ARIMAX con IMAE_1 y TBP_8
+m1 <- auto.arima(y, xreg = X1, seasonal = FALSE)          
+```
+
+```{r}
+library(forecast)
+
+# tras ajustar m0, m1 con auto.arima(...)
+tab <- data.frame(
+  modelo = c("m0","m1"),
+  AIC = c(m0$aic,  m1$aic),
+  AICc = c(m0$aicc, m1$aicc),
+  BIC = c(m0$bic,  m1$bic)
+)
+tab[order(tab$AICc), ]   # menor es mejor
+
+```
+
+Como el objetivo final es pronosticar, es mejor el modelo m1.
+
+```{r}
+checkresiduals(m1)  
+```
+
+```{r}
+L <- function(x, k) stats::lag(x, -k)  # rezago k
+
+B <- ts.intersect(
+  dx = dx,
+  im1 = L(dimae, 1),
+  tbp8 = L(dtbp, 8),
+  tc3 = L(dtc, 3),
+  tc4 = L(dtc, 4)
+)
+
+library(dynlm) 
+m0 <- dynlm(dx ~ 1, data = B)
+m1 <- dynlm(dx ~ im1, data = B)
+m2 <- dynlm(dx ~ im1 + tbp8, data = B)
+m3 <- dynlm(dx ~ im1 + tbp8 + tc3 + tc4, data = B)
+
+data.frame(
+  modelo = c("m0","m1","m2","m3"),
+  AIC = sapply(list(m0,m1,m2,m3), AIC),
+  BIC = sapply(list(m0,m1,m2,m3), BIC)
+)[order(sapply(list(m0,m1,m2,m3), BIC)), ]
+
+
+
+
+```
+
+
+
+
+
+
+
+
+
+```{r}
+par(mfrow = c(2,3))
+ccf(dx, imaeF, lag.max = 12, na.action = na.omit, main = "CCF: dx vs IMAE")
+ccf(dx, tcF, lag.max = 12, na.action = na.omit, main = "CCF: dx vs diff log TipoCambio")
+ccf(dx, tbpF, lag.max = 12, na.action = na.omit, main = "CCF: dx vs diff TBP")
+ccf(dx, ipcF, lag.max = 12, na.action = na.omit, main = "CCF: dx vs IPC")
+ccf(dx, ismrF, lag.max = 12, na.action = na.omit, main = "CCF: dx vs ISMR")
+par(mfrow = c(1,1))
+```
+
+```{r}
+summary(df)
+```
+```{r}
+# ===============================
+# Modelo de espacio–estado (BSM)
+# ===============================
+
+# Serie objetivo (ya definida antes)
+y <- x   # tasa de desempleo mensual
+
+# Modelo estructural básico:
+# y_t = nivel_t + pendiente_t + estacionalidad_t + ruido_t
+# (BSM = Basic Structural Model)
+fit_BSM <- StructTS(y, type = "BSM")
+
+fit_BSM   # varianzas estimadas de nivel, pendiente, estacionalidad y ruido
+
+# Diagnóstico rápido de residuos
+tsdiag(fit_BSM)
+
+
+fit_bsm <- StructTS(x, type = "BSM")
+res_bsm <- residuals(fit_bsm)
+
+par(mfrow=c(2,2))
+plot(res_bsm, main="Residuos modelo BSM", ylab="")
+acf(res_bsm, main="ACF residuos BSM")
+hist(res_bsm, main="Histograma residuos BSM")
+qqnorm(res_bsm); qqline(res_bsm)
+par(mfrow=c(1,1))
+
+Box.test(res_bsm, lag=12, type="Ljung")
+
+
+```
+
+
+
+
+```{r}
+# ===============================
+# Suavizado de Kalman
+# ===============================
+
+smooth_BSM <- tsSmooth(fit_BSM)  # estados suavizados: level, slope, seas
+
+par(mfrow = c(2,1), mar = c(3,4,2,1))
+
+# Observado vs nivel suavizado
+plot(y,
+     main = "Tasa de desempleo vs. nivel suavizado",
+     ylab = "Tasa (%)", xlab = "")
+lines(smooth_BSM[,"level"], col = 2, lwd = 2)
+legend("topright",
+       legend = c("Observado", "Nivel suavizado"),
+       col = c(1,2), lty = 1, bty = "n")
+
+# Pendiente suavizada
+plot(smooth_BSM[,"slope"],
+     main = "Pendiente suavizada (cambio en la tendencia)",
+     ylab = "", xlab = "")
+
+par(mfrow = c(1,2))
+```
+
+
+
+
+```{r}
+# ===============================
+# Pronóstico 12 meses con el BSM
+# ===============================
+
+library(forecast)
+library(ggplot2)
+
+h <- 12
+fc_BSM <- forecast(fit_BSM, h = h)
+
+autoplot(fc_BSM) +
+  labs(title = "Pronóstico tasa de desempleo (BSM)",
+       x = "Año", y = "Tasa (%)")
+```
+
+
+
+
+
+

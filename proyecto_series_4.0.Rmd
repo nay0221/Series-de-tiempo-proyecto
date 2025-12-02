@@ -1,0 +1,554 @@
+---
+title: "Proyecto Series 4.0"
+author: "Sofía Bocker"
+date: "2025-11-22"
+output: html_document
+---
+
+```{r}
+library(astsa)
+library(dynlm) 
+library(tidyverse)
+library(readxl)
+library(forecast)
+ library(sandwich)
+library(lmtest)
+
+
+```
+
+```{r}
+# Base de datos
+df <- read_excel("base_desempleo_final.xlsx")
+```
+
+# Exploratorio
+
+```{r}
+to_ts <- function(v, start_year=2010, start_month=9) ts(v, start=c(start_year, start_month), frequency=12)
+
+y <- to_ts(df$`Tasa de desempleo`, 2010, 9)   # serie objetivo
+imae <- to_ts(df$IMAE, 2010, 9)
+ipc <- to_ts(df$IPC, 2010, 9)
+tc <- to_ts(df$`Tipo de cambio (promedio)`, 2010, 9)
+tbp <- to_ts(df$TBP, 2010, 9)
+ismr <- to_ts(df$ISMR, 2010, 9)
+
+plot(y, main="Desempleo: serie original", xlab="", ylab="%")
+```
+
+```{r}
+summary(fit <- lm(y ~ time(y), na.action=NULL))
+
+plot(y, ylab="Tasa desempleo")
+abline(fit)
+```
+
+```{r}
+par(mfrow = c(1,2))
+acf(y, 48, main="ACF Serie Desempleo")
+pacf(y, 48, main="PACF Serie Desempleo")
+```
+
+```{r}
+# página 112 del Shumway
+acf2(y, 48) # will produce values and a graphic
+(regr = ar.ols(y, order=2, demean=FALSE, intercept=TRUE)) 
+regr$asy.se.coef # standard errors of the estimates
+```
+
+
+```{r}
+lag1.plot(y, 12)
+```
+
+```{r}
+par(mfrow = c(2,3))
+acf(imae, 48, main="IMAE")
+acf(ipc, 48, main="IPC")
+acf(tc, 48, main="Tipo de Cambio")
+acf(tbp, 48, main="TBP")
+acf(ismr, 48, main="ISMR")
+```
+
+```{r}
+lag2.plot(y, imae, 8)  # imae vs desempleo
+lag2.plot(y, ipc, 8)  # ipc vs desempleo
+lag2.plot(y, tc, 8)  # tipo de cambio vs desempleo
+lag2.plot(y, tbp, 8)  # tbp vs desempleo
+lag2.plot(y, ismr, 8)  # ismr vs desempleo
+```
+
+```{r}
+ccf(y, imae, lag.max = 8)  
+ccf(y, ipc, lag.max = 8)
+ccf(y, tc, lag.max = 8)
+ccf(y, tbp, lag.max = 8)
+ccf(y, ismr, lag.max = 8)
+```
+
+
+Página 148 del Shumway menciona usar diff log para indicadores económicos 
+
+
+```{r}
+tcF <- diff(log(tc)) 
+par(mfrow = c(2,3))
+acf(imae, 48, main="IMAE")
+acf(ipc, 48, main="IPC")
+acf(tcF, 48, main="Tipo de Cambio")
+acf(tbp, 48, main="TBP")
+acf(ismr, 48, main="ISMR")
+```
+
+```{r}
+par(mfrow = c(1,2))
+plot(tc)
+plot(tcF)
+plot(imae)
+plot(ipc)
+plot(tbp)
+plot(ismr)
+```
+
+## Utilizando tipo de cambio en nivel (sin transformar)
+
+```{r}
+scan_lags <- function(y, z, max_lag = 8, name = "Z"){
+  out <- lapply(0:max_lag, function(L){
+    dat <- ts.intersect(y = y, zL = stats::lag(z, -L))
+    if(NROW(dat) > 5){
+      mod <- dynlm(y ~ zL, data = as.data.frame(dat))
+      co <- summary(mod)$coefficients
+      data.frame(
+        var = name,
+        lag = L,
+        beta = unname(co["zL","Estimate"]),
+        t = unname(co["zL","t value"]),
+        p = unname(co["zL","Pr(>|t|)"]),
+        R2 = summary(mod)$r.squared,
+        stringsAsFactors = FALSE
+      )
+    } else {
+      data.frame(var = name, lag = L, beta = NA_real_, t = NA_real_,
+                 p = NA_real_, R2 = NA_real_, stringsAsFactors = FALSE)
+    }
+  })
+  do.call(rbind, out)
+}
+
+ord <- function(df) df[order(-abs(df$t)), c("var","lag","beta","t","p","R2")]
+
+lags_imae <- scan_lags(y, imae, name="IMAE")
+lags_ipc <- scan_lags(y, ipc, name="IPC")
+lags_ismr <- scan_lags(y, ismr, name="ISMR")
+lags_tc <- scan_lags(y, tc, name="TC")
+lags_tbp <- scan_lags(y, tbp,name="TBP")
+
+ord(lags_imae); ord(lags_tc); ord(lags_tbp); ord(lags_ipc); ord(lags_ismr)
+
+```
+
+Curiosamente, el IMAE no parece ser relevante, pero en todo caso si queremos agarrar uno sería $IMAE_{t-5}$.
+
+Para TC, el lag 0 es casi significativo. Agarraríamos $TC_{t}$
+
+Sospechoso, pero todos los lags para TBP parecen ser significativos. Sería agarrar $TBP_{t-3}$, pero está rara la cosa. Algunas razones por la que puede suceder esto son:
+- la serie tiene una tendencia lineal parecida al desempleo
+- cuando ambas están correlacionadas por estructura temporal compartida.
+no sé si sólo ignorarlo ya que el profe nos dijo que sólo nos importa lo predictivo, no interpretarlo.
+
+De igual manera, IPC parece tener todos los lags relevantes. Se toma $IPC_{t-4}$.
+
+Por último, ISMR parece ser débil, pero el lag maás fuerte sería $ISMR_{t-8}$
+
+
+## Modelo de regresión múltiple 
+
+Utilizando los rezagos que acabamos de encontrar
+
+
+```{r}
+data = ts.intersect(y,
+                    IMAE_5 = stats::lag(imae, -5),
+                    TC_0 = stats::lag(tc, -0),
+                    TBP_3 = stats::lag(tbp, -3),
+                    IPC_4 = stats::lag(ipc, -4),
+                    ISMR_8 = stats::lag(ismr, -8), 
+                    dframe=TRUE)
+
+fit_reg <- lm(y ~ IMAE_5 + TC_0 + TBP_3 + IPC_4 + ISMR_8, data=data, na.action=NULL)
+summary(fit_reg)
+res <- residuals(fit_reg)
+
+```
+
+Este es el modelo
+
+$Desempleo_t = \beta_0 + \beta_1 IMAE_{t-5} + \beta_2 TC_t + \beta_3 TBP_{t-3} + \beta_4 IPC_{t-4} + \beta_5 ISMR_{t-8} + \epsilon_t $
+
+El $R^2$ indica que las covariables explican el 36,5% de la variabilidad de la tasa de desempleo mensual. Con $p = 2,519e-7 < 0,05$, se puede decir que en conjunto las covariables sí aportan información predictiva.
+
+- $TBP_3$ es la covariable más fuerte, aumentos en la TBP tres meses antes se asocian con mayor desempleo.
+- $IPC_4$ dice que la inflación rezagada 4 meses predice un aumento en el desempleo.
+- $ISMR_8$ indica que incrementos en los SMR predicen más desempleo 8 meses después.
+- $TC_0$ tiene un efecto pequeño y se interpreta como que la depreciación inmediata puede afectar inflación o la importación, lo que termina afectado la actividad laboral.
+- $IMAE_5$ no es significativo, se podría eliminar. Pero no sé si eso es meterse con la parte interpretativa.
+
+```{r}
+# diganóstico de residuos
+res <- residuals(fit_reg)
+tsdisplay(res)
+Box.test(res, lag = 12, type = "Ljung")
+```
+
+Se puede ver que el modelo no captó toda la dependencia temporal, los residuos no son ruido blanco.
+
+La serie residual tiene patrones oscilantes muy claros (se ve que sube y baja, sube y baja y así sucesivamente). 
+
+En el ACF, el lag 1 es el alto y el lag 2 lo sigue, mientras que los demás tienen un autocorrelación moderada. Esto quiere decir que los residuos están correlacionados con el residuo de hace uno y dos pasos. Además, parece caer exponencialmennte, característico de un modelo AR.
+
+En el PACF igualemnte se ve un pico grande en lag 1, lag 2, sugeriendo de igual AR(2).
+
+En la prueba Box-Ljung se redaza la $H_0$ de los residuos son ruido blanco. 
+
+Por tanto, parece que lo mejor es ajustar un modelo ARIMA, específicamente ARIMA(2,0,0). Se puede comparar con un auto.arima
+
+```{r}
+# es el mismo acf y pacf del chunk anterior, pero se ven mejor
+plot(resid(fit_reg))
+acf2(resid(fit_reg)) 
+```
+
+```{r}
+# ARIMA(2,0,0)
+fit_ar2 <- Arima(res, order = c(2,0,0))
+fit_ar2
+```
+
+
+```{r}
+# para ver cuál nos sirve más según auto.arima
+fit_ar <- auto.arima(res, seasonal = FALSE)
+fit_ar
+```
+
+```{r}
+data = ts.intersect(y,
+                    IMAE_5 = stats::lag(imae, -5),
+                    TC_0 = stats::lag(tc, -0),
+                    TBP_3 = stats::lag(tbp, -3),
+                    IPC_4 = stats::lag(ipc, -4),
+                    ISMR_8 = stats::lag(ismr, -8), 
+                    dframe=TRUE)
+
+y_arima <- data$y
+Xreg_arima <- as.matrix(data[, c("IMAE_5","TC_0","TBP_3","IPC_4","ISMR_8")])
+
+# ajustar el ARIMAX(2,0,0) con xreg
+fit_final <- Arima(
+  y_arima,
+  order = c(2,0,0),
+  xreg = Xreg_arima,
+  include.mean = TRUE
+)
+
+summary(fit_final)
+```
+
+```{r}
+# resultados arimax escogido visualmente
+tsdisplay(residuals(fit_final))
+Box.test(residuals(fit_final), lag = 12, type = "Ljung")
+```
+
+```{r}
+# arimax(0,0,2) recomendado por auto.arima
+fit_recom <- Arima(
+  y_arima,
+  order = c(0,0,2),
+  xreg = Xreg_arima,
+  include.mean = TRUE
+)
+
+summary(fit_recom)
+```
+
+```{r}
+# arimax(0,0,2) escogido por auto.arima
+tsdisplay(residuals(fit_recom))
+Box.test(residuals(fit_recom), lag = 12, type = "Ljung")
+```
+
+## Utilizando diff(log(tc)) (transformando)
+
+```{r}
+lags_tcF <- scan_lags(y, tcF, name="TC")
+
+ord(lags_imae); ord(lags_tcF); ord(lags_tbp); ord(lags_ipc); ord(lags_ismr)
+
+```
+
+Con TC transformado, nos sale que $TC_{t-3}$ es el que tiene mayor signficancia. Nos sirve más que el TC sin transformar, porque salió sin rezago y necesitamos rezagos para predecir.
+
+## Modelo de regresión múltiple 
+
+Utilizando los rezagos que acabamos de encontrar
+
+```{r}
+# regresión
+data2 = ts.intersect(y,
+                    IMAE_5 = stats::lag(imae, -5),
+                    TC_3 = stats::lag(tcF, -3),
+                    TBP_3 = stats::lag(tbp, -3),
+                    IPC_4 = stats::lag(ipc, -4),
+                    ISMR_8 = stats::lag(ismr, -8), 
+                    dframe=TRUE)
+
+fit_reg2 <- lm(y ~ IMAE_5 + TC_3 + TBP_3 + IPC_4 + ISMR_8, data=data2, na.action=NULL)
+summary(fit_reg2)
+res2 <- residuals(fit_reg2)
+
+```
+
+Creo que está dando peor, las variables ahora tienen menos significancia.
+
+```{r}
+# diganóstico de residuos
+res2 <- residuals(fit_reg2)
+tsdisplay(res2)
+Box.test(res2, lag = 12, type = "Ljung")
+```
+
+ARIMA(1,0,2)? el PACF está cortando en p=1 (AR(1)), pero no sé si el ACF está decayendo o cortando en q=2 (MA(2))
+
+```{r}
+# es el mismo acf y pacf, pero se ven mejor
+plot(resid(fit_reg2))
+acf2(resid(fit_reg2)) 
+```
+
+```{r}
+# ARIMA(1,0,2)
+fit_ar1  <- Arima(res2, order = c(1,0,2))
+fit_ar1
+```
+
+```{r}
+# para ver cuál nos sirve más según auto.arima
+fit_auto2 <- auto.arima(res2, seasonal = FALSE)
+fit_auto2
+```
+
+```{r}
+data2 = ts.intersect(y,
+                    IMAE_5 = stats::lag(imae, -5),
+                    TC_3 = stats::lag(tcF, -0),
+                    TBP_3 = stats::lag(tbp, -3),
+                    IPC_4 = stats::lag(ipc, -4),
+                    ISMR_8 = stats::lag(ismr, -8), 
+                    dframe=TRUE)
+
+y_arima2 <- data2$y
+Xreg_arima2 <- as.matrix(data2[, c("IMAE_5","TC_3","TBP_3","IPC_4","ISMR_8")])
+
+# ajustar el ARIMAX(1,0,2) con xreg
+fit_final2 <- Arima(
+  y_arima2,
+  order = c(1,0,2),
+  xreg = Xreg_arima2,
+  include.mean = TRUE
+)
+
+summary(fit_final2)
+```
+
+```{r}
+# resultados ARIMAX(1,0,2)
+tsdisplay(residuals(fit_final2))
+Box.test(residuals(fit_final2), lag = 12, type = "Ljung")
+```
+
+```{r}
+# comparando ARIMAX(1,0,0), ARIMAX(1,0,1), ARIMAX(1,0,2),
+fit_ar100  <- Arima(y_arima2, xreg = Xreg_arima2, order = c(1, 0, 0))
+fit_ar101 <- Arima(y_arima2, xreg = Xreg_arima2, order = c(1, 0, 1))
+fit_ar102 <- Arima(y_arima2, xreg = Xreg_arima2, order = c(1, 0, 2))
+
+AIC(fit_ar100, fit_ar101, fit_ar102)
+checkresiduals(fit_ar100)
+checkresiduals(fit_ar101)
+checkresiduals(fit_ar102)
+
+```
+
+Parece que el ARIMA(1,0,2) es el que se ajusta mejor (de los escogidos visualmente)
+
+```{r}
+# arima recomendado por auto.arima
+fit_recom2 <- Arima(
+  y_arima2,
+  order = c(0,0,2),
+  xreg = Xreg_arima2,
+  include.mean = TRUE
+)
+
+summary(fit_recom2)
+```
+
+```{r}
+# arimax(0,0,2) escogido por auto.arima
+tsdisplay(residuals(fit_recom2))
+Box.test(residuals(fit_recom2), lag = 12, type = "Ljung")
+
+# comparar arimax(0,0,2) escogido por auto.arima con arimax(1,0,2) escogido visualmente
+checkresiduals(fit_recom2)
+checkresiduals(fit_ar102)
+```
+
+Parece que ARIMAX(1,0,2) da mejor que hasta ARIMAX(0,0,2) recomendado por el auto.arima
+
+# Pronosticos
+```{r}
+h <- 3   # basandonos en el rezago mas pequeño que tenemos,pronostico puede ser tan largo como el rezago mas corto
+```
+
+```{r}
+# extender la serie de desempleo con h NA
+y_ext <- ts(c(as.numeric(y_arima2), rep(NA, h)),  #se crea vector de h (3 en nuestro caso) de na para poner los futuros a pronosticar
+            start = start(y_arima2),
+            frequency = frequency(y_arima2))
+
+# volver a intersectar usando las mismas transformaciones que en data2
+data_ext <- ts.intersect(
+  y_ext, #el que se hizo incluyendo los que van a ser predichos
+  IMAE_5 = stats::lag(imae, -5), 
+  TC_3   = stats::lag(tcF, -0),
+  TBP_3  = stats::lag(tbp, -3),
+  IPC_4  = stats::lag(ipc, -4),
+  ISMR_8 = stats::lag(ismr, -8),
+  dframe = TRUE
+)
+
+
+n_tot <- nrow(data_ext) #numero filas totales con historico y futuro
+X_future <- as.matrix(
+  data_ext[(n_tot - h + 1):n_tot, c("IMAE_5","TC_3","TBP_3","IPC_4","ISMR_8")]
+)
+```
+
+
+```{r}
+fc <- forecast(fit_final2, h = h, xreg = X_future) #ARIMAX(1,0,2)
+
+fc
+autoplot(fc)
+
+```
+Con el modelo arimax(1,0,2) estimado y usando los valores de las variables explicativas se obtienen pronosticos para el periodo nov 2018-enero 2019
+
+# En que medida mejora el pronostico las variables consideradas
+## ARIMA(1,0,2) univariado vs ARIMAX(1,0,2)
+
+```{r}
+
+#Modelo base: ARIMA(1,0,2) univariado 
+fit_uni <- Arima(
+  y_arima2,
+  order = c(1,0,2),
+  include.mean = TRUE
+)
+
+acc_uni    <- accuracy(fit_uni) # ARIMA solo
+acc_arimax <- accuracy(fit_final2)# ARIMAX con X
+
+acc_uni
+acc_arimax
+
+# calcular % de mejora en RMSE, MAE y MAPE (ARIMAX vs ARIMA)
+rmse_uni    <- acc_uni["Training set", "RMSE"]
+rmse_arimax <- acc_arimax["Training set", "RMSE"]
+
+mae_uni    <- acc_uni["Training set", "MAE"]
+mae_arimax <- acc_arimax["Training set", "MAE"]
+
+mape_uni    <- acc_uni["Training set", "MAPE"]
+mape_arimax <- acc_arimax["Training set", "MAPE"]
+
+mejora_rmse  <- 100 * (rmse_uni  - rmse_arimax)  / rmse_uni
+mejora_mae   <- 100 * (mae_uni   - mae_arimax)   / mae_uni
+mejora_mape  <- 100 * (mape_uni  - mape_arimax)  / mape_uni
+
+mejora_rmse   # % reduccion del RMSE al meter las variables
+mejora_mae    # % reduccion del MAE
+mejora_mape   # % reduccion del MAPE
+
+```
+
+Dentro de la muestra, se compara un modelo ARIMA(1,0,2) univariado con el modelo ARIMAX(1,0,2) incluyendo el IMAE, el IPC, la TBP, el tipo de cambio y el ISMR. Los resultados de exactitud dentro de la muestra muestran que el RMSE se reduce de 0.297 a 0.281 (5.6%), el MAE de 0.227 a 0.219 (3.6%) y el MAPE de 2.35% a 2.27% (3.8%). Por lo tanto, las variables explicativas mejoran la capacidad de pronostico 
+
+## Mejora del pronostico pero con train y test
+```{r}
+# 80% test/20%prueba
+n      <- length(y_arima2)
+n_train <- floor(0.8 * n)
+
+tiempos <- time(y_arima2)
+
+y_train <- window(y_arima2, end   = tiempos[n_train])
+y_test  <- window(y_arima2, start = tiempos[n_train + 1])
+
+X_train <- Xreg_arima2[1:n_train, ]
+X_test  <- Xreg_arima2[(n_train + 1):n, ]
+
+# Modelos entrenados solo con train
+
+#ARIMA univariado en train
+fit_uni_tr <- Arima(
+  y_train,
+  order = c(1,0,2),
+  include.mean = TRUE
+)
+
+#ARIMAX en train
+fit_arimax_tr <- Arima(
+  y_train,
+  order = c(1,0,2),
+  xreg  = X_train,
+  include.mean = TRUE
+)
+
+#pronosticos respecto a test
+h_test <- length(y_test)
+
+fc_uni_test <- forecast(fit_uni_tr, h = h_test) 
+fc_arimax_test <- forecast(fit_arimax_tr, h = h_test, xreg = X_test)  # con X
+
+#Exactitud de pronostico comparando con y_test real
+acc_uni_test    <- accuracy(fc_uni_test,    y_test)
+acc_arimax_test <- accuracy(fc_arimax_test, y_test)
+
+acc_uni_test
+acc_arimax_test
+
+# % de mejora  
+rmse_uni_test    <- acc_uni_test["Test set", "RMSE"]
+rmse_arimax_test <- acc_arimax_test["Test set", "RMSE"]
+
+mae_uni_test    <- acc_uni_test["Test set", "MAE"]
+mae_arimax_test <- acc_arimax_test["Test set", "MAE"]
+
+mape_uni_test    <- acc_uni_test["Test set", "MAPE"]
+mape_arimax_test <- acc_arimax_test["Test set", "MAPE"]
+
+mejora_rmse_test <- 100 * (rmse_uni_test  - rmse_arimax_test) / rmse_uni_test
+mejora_mae_test  <- 100 * (mae_uni_test   - mae_arimax_test)  / mae_uni_test
+mejora_mape_test <- 100 * (mape_uni_test  - mape_arimax_test) / mape_uni_test
+
+mejora_rmse_test
+mejora_mae_test
+mejora_mape_test
+
+```
+Los pronosticos fuera de muestra mejoran bastante. Reduccion aproximada del 10.2 % en el RMSE, 17.2 % en el MAE y 19.0 % en el MAPE.
+

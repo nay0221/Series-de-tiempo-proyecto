@@ -1,0 +1,1689 @@
+---
+title: "Proyecto Series 4.0"
+author: "Sofía Bocker"
+date: "2025-11-22"
+output: html_document
+---
+
+```{r}
+library(astsa)
+library(dynlm) 
+library(tidyverse)
+library(readxl)
+library(forecast)
+ library(sandwich)
+library(lmtest)
+library(corrplot)
+
+
+
+```
+
+```{r}
+# Base de datos
+df <- read_excel("base_desempleo_final.xlsx")
+```
+
+# Exploratorio
+
+```{r}
+to_ts <- function(v, start_year=2010, start_month=9) ts(v, start=c(start_year, start_month), frequency=12)
+
+y <- to_ts(df$`Tasa de desempleo`, 2010, 9)   # serie objetivo
+imae <- to_ts(df$IMAE, 2010, 9)
+ipc <- to_ts(df$IPC, 2010, 9)
+tc <- to_ts(df$`Tipo de cambio (promedio)`, 2010, 9)
+tbp <- to_ts(df$TBP, 2010, 9)
+ismr <- to_ts(df$ISMR, 2010, 9)
+
+plot(y, main="Desempleo: serie original", xlab="", ylab="%")
+```
+
+```{r}
+summary(fit <- lm(y ~ time(y), na.action=NULL))
+
+plot(y, ylab="Tasa desempleo")
+abline(fit)
+```
+
+```{r}
+par(mfrow = c(1,2))
+acf(y, 48, main="ACF Serie Desempleo")
+pacf(y, 48, main="PACF Serie Desempleo")
+```
+
+```{r}
+# página 112 del Shumway
+acf2(y, 48) # will produce values and a graphic
+(regr = ar.ols(y, order=2, demean=FALSE, intercept=TRUE)) 
+regr$asy.se.coef # standard errors of the estimates
+```
+
+
+```{r}
+lag1.plot(y, 12)
+```
+
+```{r}
+par(mfrow = c(2,3))
+acf(imae, 48, main="IMAE")
+acf(ipc, 48, main="IPC")
+acf(tc, 48, main="Tipo de Cambio")
+acf(tbp, 48, main="TBP")
+acf(ismr, 48, main="ISMR")
+```
+
+```{r}
+lag2.plot(y, imae, 8)  # imae vs desempleo
+lag2.plot(y, ipc, 8)  # ipc vs desempleo
+lag2.plot(y, tc, 8)  # tipo de cambio vs desempleo
+lag2.plot(y, tbp, 8)  # tbp vs desempleo
+lag2.plot(y, ismr, 8)  # ismr vs desempleo
+```
+
+```{r}
+ccf(y, imae, lag.max = 8)  
+ccf(y, ipc, lag.max = 8)
+ccf(y, tc, lag.max = 8)
+ccf(y, tbp, lag.max = 8)
+ccf(y, ismr, lag.max = 8)
+```
+
+
+Página 148 del Shumway menciona usar diff log para indicadores económicos 
+
+
+```{r}
+tcF <- diff(log(tc)) 
+par(mfrow = c(2,3))
+acf(imae, 48, main="IMAE")
+acf(ipc, 48, main="IPC")
+acf(tcF, 48, main="Tipo de Cambio")
+acf(tbp, 48, main="TBP")
+acf(ismr, 48, main="ISMR")
+```
+```{r}
+# correlación de pearson variables crudas
+df_num <- data.frame(
+  Desempleo = df$`Tasa de desempleo`,
+  IMAE = df$IMAE,
+  IPC = df$IPC, 
+  TC = df$`Tipo de cambio (promedio)`, 
+  TBP = df$TBP,
+  ISMR = df$ISMR
+)
+matriz_corr <- cor(df_num)
+matriz_corr
+corrplot(matriz_corr)
+```
+
+```{r}
+par(mfrow = c(1,2))
+plot(tc)
+plot(tcF)
+plot(imae)
+plot(ipc)
+plot(tbp)
+plot(ismr)
+```
+
+## Utilizando tipo de cambio en nivel (sin transformar)
+
+```{r}
+scan_lags <- function(y, z, max_lag = 8, name = "Z"){
+  out <- lapply(0:max_lag, function(L){
+    dat <- ts.intersect(y = y, zL = stats::lag(z, -L))
+    if(NROW(dat) > 5){
+      mod <- dynlm(y ~ zL, data = as.data.frame(dat))
+      co <- summary(mod)$coefficients
+      data.frame(
+        var = name,
+        lag = L,
+        beta = unname(co["zL","Estimate"]),
+        t = unname(co["zL","t value"]),
+        p = unname(co["zL","Pr(>|t|)"]),
+        R2 = summary(mod)$r.squared,
+        stringsAsFactors = FALSE
+      )
+    } else {
+      data.frame(var = name, lag = L, beta = NA_real_, t = NA_real_,
+                 p = NA_real_, R2 = NA_real_, stringsAsFactors = FALSE)
+    }
+  })
+  do.call(rbind, out)
+}
+
+ord <- function(df) df[order(-abs(df$t)), c("var","lag","beta","t","p","R2")]
+
+lags_imae <- scan_lags(y, imae, name="IMAE")
+lags_ipc <- scan_lags(y, ipc, name="IPC")
+lags_ismr <- scan_lags(y, ismr, name="ISMR")
+lags_tc <- scan_lags(y, tc, name="TC")
+lags_tbp <- scan_lags(y, tbp,name="TBP")
+
+ord(lags_imae); ord(lags_tc); ord(lags_tbp); ord(lags_ipc); ord(lags_ismr)
+
+```
+
+Curiosamente, el IMAE no parece ser relevante, pero en todo caso si queremos agarrar uno sería $IMAE_{t-5}$.
+
+Para TC, el lag 0 es casi significativo. Agarraríamos $TC_{t}$
+
+Sospechoso, pero todos los lags para TBP parecen ser significativos. Sería agarrar $TBP_{t-3}$, pero está rara la cosa. Algunas razones por la que puede suceder esto son:
+- la serie tiene una tendencia lineal parecida al desempleo
+- cuando ambas están correlacionadas por estructura temporal compartida.
+no sé si sólo ignorarlo ya que el profe nos dijo que sólo nos importa lo predictivo, no interpretarlo.
+
+De igual manera, IPC parece tener todos los lags relevantes. Se toma $IPC_{t-4}$.
+
+Por último, ISMR parece ser débil, pero el lag maás fuerte sería $ISMR_{t-8}$
+
+
+## Modelo de regresión múltiple 
+
+Utilizando los rezagos que acabamos de encontrar
+
+
+```{r}
+data = ts.intersect(y,
+                    IMAE_5 = stats::lag(imae, -5),
+                    TC_0 = stats::lag(tc, -0),
+                    TBP_3 = stats::lag(tbp, -3),
+                    IPC_4 = stats::lag(ipc, -4),
+                    ISMR_8 = stats::lag(ismr, -8), 
+                    dframe=TRUE)
+
+fit_reg <- lm(y ~ IMAE_5 + TC_0 + TBP_3 + IPC_4 + ISMR_8, data=data, na.action=NULL)
+summary(fit_reg)
+res <- residuals(fit_reg)
+
+```
+
+Este es el modelo
+
+$Desempleo_t = \beta_0 + \beta_1 IMAE_{t-5} + \beta_2 TC_t + \beta_3 TBP_{t-3} + \beta_4 IPC_{t-4} + \beta_5 ISMR_{t-8} + \epsilon_t $
+
+El $R^2$ indica que las covariables explican el 36,5% de la variabilidad de la tasa de desempleo mensual. Con $p = 2,519e-7 < 0,05$, se puede decir que en conjunto las covariables sí aportan información predictiva.
+
+- $TBP_3$ es la covariable más fuerte, aumentos en la TBP tres meses antes se asocian con mayor desempleo.
+- $IPC_4$ dice que la inflación rezagada 4 meses predice un aumento en el desempleo.
+- $ISMR_8$ indica que incrementos en los SMR predicen más desempleo 8 meses después.
+- $TC_0$ tiene un efecto pequeño y se interpreta como que la depreciación inmediata puede afectar inflación o la importación, lo que termina afectado la actividad laboral.
+- $IMAE_5$ no es significativo, se podría eliminar. Pero no sé si eso es meterse con la parte interpretativa.
+
+```{r}
+# diganóstico de residuos
+res <- residuals(fit_reg)
+tsdisplay(res)
+Box.test(res, lag = 12, type = "Ljung")
+```
+
+Se puede ver que el modelo no captó toda la dependencia temporal, los residuos no son ruido blanco.
+
+La serie residual tiene patrones oscilantes muy claros (se ve que sube y baja, sube y baja y así sucesivamente). 
+
+En el ACF, el lag 1 es el alto y el lag 2 lo sigue, mientras que los demás tienen un autocorrelación moderada. Esto quiere decir que los residuos están correlacionados con el residuo de hace uno y dos pasos. Además, parece caer exponencialmennte, característico de un modelo AR.
+
+En el PACF igualemnte se ve un pico grande en lag 1, lag 2, sugeriendo de igual AR(2).
+
+En la prueba Box-Ljung se redaza la $H_0$ de los residuos son ruido blanco. 
+
+Por tanto, parece que lo mejor es ajustar un modelo ARIMA, específicamente ARIMA(2,0,0). Se puede comparar con un auto.arima
+
+```{r}
+# es el mismo acf y pacf del chunk anterior, pero se ven mejor
+plot(resid(fit_reg))
+acf2(resid(fit_reg)) 
+```
+
+```{r}
+# ARIMA(2,0,0)
+fit_ar2 <- Arima(res, order = c(2,0,0))
+fit_ar2
+```
+
+
+```{r}
+# para ver cuál nos sirve más según auto.arima
+fit_ar <- auto.arima(res, seasonal = FALSE)
+fit_ar
+```
+
+```{r}
+data = ts.intersect(y,
+                    IMAE_5 = stats::lag(imae, -5),
+                    TC_0 = stats::lag(tc, -0),
+                    TBP_3 = stats::lag(tbp, -3),
+                    IPC_4 = stats::lag(ipc, -4),
+                    ISMR_8 = stats::lag(ismr, -8), 
+                    dframe=TRUE)
+
+y_arima <- data$y
+Xreg_arima <- as.matrix(data[, c("IMAE_5","TC_0","TBP_3","IPC_4","ISMR_8")])
+
+# ajustar el ARIMAX(2,0,0) con xreg
+fit_final <- Arima(
+  y_arima,
+  order = c(2,0,0),
+  xreg = Xreg_arima,
+  include.mean = TRUE
+)
+
+summary(fit_final)
+```
+
+```{r}
+# resultados arimax escogido visualmente
+tsdisplay(residuals(fit_final))
+Box.test(residuals(fit_final), lag = 12, type = "Ljung")
+```
+
+```{r}
+# arimax(0,0,2) recomendado por auto.arima
+fit_recom <- Arima(
+  y_arima,
+  order = c(0,0,2),
+  xreg = Xreg_arima,
+  include.mean = TRUE
+)
+
+summary(fit_recom)
+```
+
+```{r}
+# arimax(0,0,2) escogido por auto.arima
+tsdisplay(residuals(fit_recom))
+Box.test(residuals(fit_recom), lag = 12, type = "Ljung")
+```
+
+## Utilizando diff(log(tc)) (transformando)
+
+```{r}
+lags_tcF <- scan_lags(y, tcF, name="TC")
+
+ord(lags_imae); ord(lags_tcF); ord(lags_tbp); ord(lags_ipc); ord(lags_ismr)
+
+```
+
+Con eso definimos las variables explicativas finales:
+$IMAE_{t-5}$, $TCF_{t-3}$, $TBP_{t-3}$, $IPC_{t-4}$ e $ISMR_{t-8}$
+
+
+Con TC transformado, nos sale que $TC_{t-3}$ es el que tiene mayor signficancia. Nos sirve más que el TC sin transformar, porque salió sin rezago y necesitamos rezagos para predecir.
+
+## Modelo de regresión múltiple 
+
+Utilizando los rezagos que acabamos de encontrar
+
+```{r}
+# regresión
+data2 = ts.intersect(y,
+                    IMAE_5 = stats::lag(imae, -5),
+                    TC_3 = stats::lag(tcF, -3),
+                    TBP_3 = stats::lag(tbp, -3),
+                    IPC_4 = stats::lag(ipc, -4),
+                    ISMR_8 = stats::lag(ismr, -8), 
+                    dframe=TRUE)
+
+fit_reg2 <- lm(y ~ IMAE_5 + TC_3 + TBP_3 + IPC_4 + ISMR_8, data=data2, na.action=NULL)
+summary(fit_reg2)
+res2 <- residuals(fit_reg2)
+
+```
+
+```{r}
+# diganóstico de residuos
+res2 <- residuals(fit_reg2)
+tsdisplay(res2)
+Box.test(res2, lag = 12, type = "Ljung")
+```
+Se observa que los residuos de la regresión aún presentan dependencia temporal. La ACF muestra dos retardos iniciales claramente significativos
+(lags 1 y 2) y luego un decaimiento progresivo, patrón compatible con un componente
+MA(2). Por su parte, la PACF presenta un pico fuerte únicamente en el rezago 1 y, a
+partir de ahí, las autocorrelaciones parciales caen cerca de cero, lo que es típico de
+un término AR(1)
+
+ARIMA(1,0,2)
+
+```{r}
+# es el mismo acf y pacf, pero se ven mejor
+plot(resid(fit_reg2))
+acf2(resid(fit_reg2)) 
+```
+
+```{r}
+# ARIMA(1,0,2)
+fit_ar1  <- Arima(res2, order = c(1,0,2))
+fit_ar1
+```
+
+```{r}
+# para ver cuál nos sirve más según auto.arima
+fit_auto2 <- auto.arima(res2, seasonal = FALSE)
+fit_auto2
+```
+
+```{r}
+data2 = ts.intersect(y,
+                    IMAE_5 = stats::lag(imae, -5),
+                    TC_3 = stats::lag(tcF, -3),
+                    TBP_3 = stats::lag(tbp, -3),
+                    IPC_4 = stats::lag(ipc, -4),
+                    ISMR_8 = stats::lag(ismr, -8), 
+                    dframe=TRUE)
+
+y_arima2 <- data2$y
+Xreg_arima2 <- as.matrix(data2[, c("IMAE_5","TC_3","TBP_3","IPC_4","ISMR_8")])
+
+# ajustar el ARIMAX(1,0,2) con xreg
+fit_final2 <- Arima(
+  y_arima2,
+  order = c(1,0,2),
+  xreg = Xreg_arima2,
+  include.mean = TRUE
+)
+
+summary(fit_final2)
+```
+
+```{r}
+# resultados ARIMAX(1,0,2)
+tsdisplay(residuals(fit_final2))
+Box.test(residuals(fit_final2), lag = 12, type = "Ljung")
+```
+
+```{r}
+# comparando ARIMAX(1,0,0), ARIMAX(1,0,1), ARIMAX(1,0,2),
+fit_ar100  <- Arima(y_arima2, xreg = Xreg_arima2, order = c(1, 0, 0))
+fit_ar101 <- Arima(y_arima2, xreg = Xreg_arima2, order = c(1, 0, 1))
+fit_ar102 <- Arima(y_arima2, xreg = Xreg_arima2, order = c(1, 0, 2))
+
+AIC(fit_ar100, fit_ar101, fit_ar102)
+checkresiduals(fit_ar100)
+checkresiduals(fit_ar101)
+checkresiduals(fit_ar102)
+
+```
+
+Parece que el ARIMA(1,0,2) es el que se ajusta mejor (de los escogidos visualmente)
+
+```{r}
+# arima recomendado por auto.arima
+fit_recom2 <- Arima(
+  y_arima2,
+  order = c(0,0,2),
+  xreg = Xreg_arima2,
+  include.mean = TRUE
+)
+
+summary(fit_recom2)
+```
+
+```{r}
+# arimax(0,0,2) escogido por auto.arima
+tsdisplay(residuals(fit_recom2))
+Box.test(residuals(fit_recom2), lag = 12, type = "Ljung")
+
+# comparar arimax(0,0,2) escogido por auto.arima con arimax(1,0,2) escogido visualmente
+checkresiduals(fit_recom2)
+checkresiduals(fit_ar102)
+```
+
+Parece que ARIMAX(1,0,2) da mejor que hasta ARIMAX(0,0,2) recomendado por el auto.arima
+
+
+
+
+
+# Pronostico y viendo variables importantes
+
+
+
+```{r}
+library(forecast)
+
+#Johan
+#  datos
+
+covs_all <- c("IMAE_5","TC_3","TBP_3","IPC_4","ISMR_8")
+
+y_full <- data2$y
+X_all  <- as.matrix(data2[, covs_all])
+
+ok <- complete.cases(y_full, X_all)
+y_full <- y_full[ok]
+X_all  <- X_all[ok, , drop = FALSE]
+
+n <- length(y_full)
+h <- 3
+train_end <- n - h
+
+y_train <- y_full[1:train_end]
+y_test  <- y_full[(train_end + 1):n]
+
+
+
+#  Función para evaluar
+
+eval_set <- function(covs){
+
+  if(length(covs) == 0){
+    fit <- Arima(y_train, order=c(1,0,2), include.mean = TRUE)
+    fc  <- forecast(fit, h=h)$mean
+
+  } else {
+    X_train <- X_all[1:train_end, covs, drop=FALSE]
+    X_test  <- X_all[(train_end+1):n, covs, drop=FALSE]
+
+    fit <- Arima(y_train, order=c(1,0,2), xreg=X_train, include.mean = TRUE)
+    fc  <- forecast(fit, h=h, xreg=X_test)$mean
+  }
+
+  err  <- y_test - fc
+  rmse <- sqrt(mean(err^2))
+  mae  <- mean(abs(err))
+  mape <- mean(abs(err / y_test))*100
+
+  list(rmse=rmse, mae=mae, mape=mape)
+}
+
+
+
+
+selected  <- character(0)
+remaining <- covs_all
+
+forward_table <- data.frame(
+  step=integer(),
+  added=character(),
+  RMSE_new=double(),
+  MAE_new=double(),
+  MAPE_new=double(),
+  stringsAsFactors = FALSE
+)
+
+###  modelo sin covariables 
+base_out <- eval_set(character(0))
+
+forward_table <- rbind(
+  forward_table,
+  data.frame(
+    step=1,
+    added="(sin covariables)",
+    RMSE_new=base_out$rmse,
+    MAE_new=base_out$mae,
+    MAPE_new=base_out$mape,
+    stringsAsFactors=FALSE
+  )
+)
+
+rmse_base <- base_out$rmse
+step <- 2   # siguiente paso será el paso 2
+
+
+### agregar variables una a una 
+while(length(remaining) > 0){
+
+  # probar agregar UNA de las que faltan
+  trials <- lapply(remaining, function(v){
+    out <- eval_set(c(selected, v))
+    data.frame(
+      candidate=v,
+      rmse=out$rmse,
+      mae=out$mae,
+      mape=out$mape
+    )
+  })
+  trials <- do.call(rbind, trials)
+
+  # escoger la mejor
+  best_row  <- trials[which.min(trials$rmse), ]
+  best_var  <- best_row$candidate
+  best_rmse <- best_row$rmse
+  best_mae  <- best_row$mae
+  best_mape <- best_row$mape
+
+  # guardar paso
+  forward_table <- rbind(
+    forward_table,
+    data.frame(
+      step=step,
+      added=best_var,
+      RMSE_new=best_rmse,
+      MAE_new=best_mae,
+      MAPE_new=best_mape,
+      stringsAsFactors = FALSE
+    )
+  )
+
+  # actualizar sets
+  selected  <- c(selected, best_var)
+  remaining <- setdiff(remaining, best_var)
+  rmse_base <- best_rmse
+  step <- step + 1
+}
+
+cat("\n=== Forward Selection (comienza con modelo sin covariables) ===\n")
+print(forward_table)
+
+cat("\nOrden final (ranking de inclusión):\n")
+print(selected)
+
+
+```
+
+
+# Pronosticos
+Se hizo:
+1)Pronóstico  usando TODA la muestra (2010–2018) y predecir 3 meses mas(lo que ya estaba) .2)Pronóstico dentro de la muestra de entrenamiento (train).(aca ya se implementa la sugerencia) 3)Pronóstico fuera de muestra (test) con corte 80/20. 4)Métricas de esos pronosticos y visualizacion
+
+Explicacion general de esta seccion:
+Primero hicimos una validación predictiva contrain–test , donde se usael 80 % inicial de la muestra para estimar el modelo ARIMAX y el 20 % final se deja como conjunto de prueba. Con ese 20 % calculamos pronósticos usando las covariables observadas y comparamos contra los valores reales, obteniendo métricas RMSE, MAE y MAPE fuera de muestr, esto para evaluar qué tan bien generaliza el modelo y cuánto mejora al incluir las variables explicativas. Luego (que era lo que teniamos cuando pedimos el aval), una vez verificada la capacidad predictiva del modelo se volvió a estimar utilizando toda la muestra disponible de la tasa de desempleo y las covariables y con ese modelo final se generaron pronósticos a 3 meses hacia adelante. Es decir, el esquema train–test sirve para validar el modelo, mientras que el ajuste con toda la muestra se usa para obtener el pronóstico operativo de corto plazo.
+
+
+```{r}
+h <- 3   # basandonos en el rezago mas pequeño que tenemos,pronostico puede ser tan largo como el rezago mas corto
+
+
+
+#ACLARACION: Pronósticos train/test: horizonte = tamaño del test (varios meses), no limitado a 3 y eso esta bien porque ahi tenemos datos observados de las covariables
+
+```
+## Pronóstico en train y test con ARIMAX(1,0,2)
+```{r}
+n       <- length(y_arima2)
+n_train <- floor(0.8 * n)        # 80 % train
+tiempos <- time(y_arima2)
+
+y_train <- window(y_arima2, end   = tiempos[n_train])
+y_test  <- window(y_arima2, start = tiempos[n_train + 1])
+
+#Split para X (es matriz → usamos índices)
+X_train <- Xreg_arima2[1:n_train, , drop = FALSE]
+X_test  <- Xreg_arima2[(n_train + 1):n, , drop = FALSE] #se hace asi para que no de errores de indices (sugerencia)
+
+#ARIMAX(1,0,2) solo con train
+fit_train <- Arima(
+  y_train,
+  order = c(1, 0, 2),
+  xreg  = X_train,
+  include.mean = TRUE
+)
+
+summary(fit_train)
+
+#Pronóstico en train, valores ajustados
+fitted_train <- fitted(fit_train)
+
+#Pronóstico en test
+h_test <- length(y_test)
+
+fc_test <- forecast(
+  fit_train,
+  h    = h_test,
+  xreg = X_test
+)
+
+acc_train <- accuracy(fitted_train, y_train)[1, c("RMSE","MAE","MAPE")]
+acc_test  <- accuracy(fc_test,       y_test )[2, c("RMSE","MAE","MAPE")]
+
+rbind(Train = acc_train,
+      Test  = acc_test)
+```
+Al ajustar el modelo ARIMAX(1,0,2) sobre el 80 % inicial de la muestra
+obtenemos un intercepto (vean columna intercept) cercano a 8.9 y coeficientes positivos para todas las
+covariables rezagadas, entonces en promedio mayores niveles de actividad, tipo de
+cambio, tasas de interés e índice de salarios están asociados con mayores tasas de
+desempleo. El término AR(1) es moderado (0.24) y los términos MA(1) y MA(2) son elevados (0.96 y 0.71), indicando que gran parte de la dinámica de corto plazo se captura a través de la parte media móvil.
+El error residual del modelo en entrenamiento es bajo ($\text{RMSE}\approx 0.25$,
+$\text{MAE}\approx 0.19$, $\text{MAPE}\approx 2\%$), mientras que en el conjunto de
+prueba (20 % final de la muestra) los errores aumentan, como es de esperar en pronósticos
+fuera de muestra, pero se mantienen en niveles razonables
+($\text{RMSE}\approx 0.54$, $\text{MAE}\approx 0.44$, $\text{MAPE}\approx 4.7\%$).
+Estos resultados confirman que el ARIMAX(1,0,2) es capaz de reproducir bastante bien la
+tasa de desempleo en nivel y de generar pronósticos de corto plazo con errores
+moderados sobre la variable original.
+
+
+```{r}
+# Serie con pronóstico en todo el periodo:
+y_hat_all <- ts(
+  c(as.numeric(fitted_train), as.numeric(fc_test$mean)),
+  start     = start(y_arima2),
+  frequency = frequency(y_arima2)
+)
+
+autoplot(y_arima2, series = "Observado") +
+  autolayer(y_hat_all, series = "Pronóstico ARIMAX(1,0,2)", linetype = "dashed") +
+  geom_vline(xintercept = tiempos[n_train],
+             linetype = "dotted", colour = "red") +
+  labs(x = "Tiempo", y = "Tasa de desempleo",
+       title = "Pronósticos dentro y fuera de muestra (ARIMAX(1,0,2))") +
+  theme_minimal()
+```
+Pronósticos dentro y fuera de muestra del modelo ARIMAX(1,0,2) sobre la tasa de desempleo en nivel. La línea continua roja es la serie observada y la línea punteada celeste al valor pronosticado por
+el modelo; la línea vertical roja marca la separación entre el 80 % usado para
+entrenamiento (a la izquierda) y el 20 % final usado como conjunto de prueba (a la
+derecha).
+
+En el tramo de entrenamiento las dos líneas prácticamente se superponen, lo que indica
+que el ARIMAX(1,0,2) reproduce muy bien la dinámica histórica de la tasa de desempleo.
+En el tramo de prueba, el modelo sigue capturando el nivel promedio, pero tiende a
+suavizar los movimientos: subestima los repuntes y la volatilidad observada al final de
+la muestra. Esto es consistente con los errores fuera de muestra reportados
+($\text{RMSE}\approx 0.54$, $\text{MAE}\approx 0.44$, $\text{MAPE}\approx 4.7\%$):
+el modelo tiene una capacidad predictiva razonable a corto plazo, aunque le cuesta
+recoger completamente los cambios bruscos recientes en el desempleo.
+
+### Pronóstico en train y test con ARIMAX(0,0,2)
+
+```{r}
+n       <- length(y_arima2)
+n_train <- floor(0.8 * n)        # 80 % train
+tiempos <- time(y_arima2)
+
+y_train <- window(y_arima2, end   = tiempos[n_train])
+y_test  <- window(y_arima2, start = tiempos[n_train + 1])
+
+X_train <- Xreg_arima2[1:n_train, , drop = FALSE] 
+X_test  <- Xreg_arima2[(n_train + 1):n, , drop = FALSE]
+
+#ARIMAX(0,0,2) 
+fit_train_002 <- Arima(
+  y_train,
+  order = c(0, 0, 2),      #modelo sugerido por auto.arima
+  xreg  = X_train,
+  include.mean = TRUE
+)
+
+summary(fit_train_002)
+
+#Pronóstico dentro de muestra 
+fitted_train_002 <- fitted(fit_train_002)
+
+#Pronóstico fuera de muestra 
+h_test <- length(y_test)
+
+fc_test_002 <- forecast(
+  fit_train_002,
+  h    = h_test,
+  xreg = X_test
+)
+
+
+acc_train_002 <- accuracy(fitted_train_002, y_train)[1, c("RMSE","MAE","MAPE")]
+acc_test_002  <- accuracy(fc_test_002,       y_test )[2, c("RMSE","MAE","MAPE")]
+
+rbind(Train_002 = acc_train_002,
+      Test_002  = acc_test_002)
+```
+Como punto de comparación, también estimamos un modelo ARIMAX(0,0,2) con las mismas
+covariables rezagadas siguiendo la sugerencia de auto.arima. En este caso la dinámica de los
+errores se concentra en dos términos MA de gran magnitud ($ma_1 \approx 1.09$ y
+$ma_2 \approx 0.77$), mientras que todas las covariables mantienen coeficientes
+positivos y estadísticamente significativos, coherentes con el modelo anterior.
+
+En el conjunto de entrenamiento (80 % inicial) el ARIMAX(0,0,2) presenta errores muy
+similares al ARIMAX(1,0,2) ($\text{RMSE}\approx 0.25$, $\text{MAE}\approx 0.19$,
+$\text{MAPE}\approx 2\%$), lo que indica que ambos reproducen de manera casi idéntica
+la trayectoria histórica del desempleo en nivel. En el conjunto de prueba (20 % final)
+las diferencias también son muy pequeñas: el modelo ARIMAX(0,0,2) obtiene
+$\text{RMSE}\approx 0.54$, $\text{MAE}\approx 0.44$ y $\text{MAPE}\approx 4.62\%$,
+mientras que el ARIMAX(1,0,2) arroja $\text{RMSE}\approx 0.54$,
+$\text{MAE}\approx 0.44$ y $\text{MAPE}\approx 4.70\%$. Es decir, el modelo sugerido
+por `auto.arima` logra una precisión fuera de muestra prácticamente indistinguible de la
+del ARIMAX(1,0,2), con una ligera ventaja en términos de MAE y MAPE.
+
+```{r}
+y_hat_all_002 <- ts(
+  c(as.numeric(fitted_train_002), as.numeric(fc_test_002$mean)),
+  start     = start(y_arima2),
+  frequency = frequency(y_arima2)
+)
+
+autoplot(y_arima2, series = "Observado") +
+  autolayer(y_hat_all_002, series = "Pronóstico ARIMAX(0,0,2)", linetype = "dashed") +
+  geom_vline(xintercept = tiempos[n_train],
+             linetype = "dotted", colour = "red") +
+  labs(x = "Tiempo", y = "Tasa de desempleo",
+       title = "Pronósticos dentro y fuera de muestra (ARIMAX(0,0,2))") +
+  theme_minimal()
+```
+
+Se presentan los pronósticos dentro y fuera de muestra obtenidos con el modelo ARIMAX(0,0,2) sobre la tasa de desempleo en nivel. La línea continua roja corresponde a la serie observada y la línea punteada celeste al pronóstico del modelo, mientras que la línea vertical roja punteada marca el corte entre el periodo utilizado para estimar el modelo (80 % inicial de la muestra) y el periodo de prueba (20 % final).
+
+En el tramo de estimación las dos curvas prácticamente se superponen, lo que indica que el ARIMAX(0,0,2) reproduce adecuadamente la trayectoria histórica del desempleo y capta la tendencia descendente y las oscilaciones de corto plazo de la serie. En el tramo de prueba el modelo sigue la dinámica general del desempleo, pero de forma más suavizada: captura el nivel promedio, aunque amortigua los movimientos más bruscos y tiende a subestimar los picos recientes de la tasa de desempleo. En conjunto, el gráfico muestra
+que el ARIMAX(0,0,2) ofrece una aproximación razonable a la evolución de la tasa de desempleo y proporciona pronósticos de corto plazo coherentes con el comportamiento histórico de la serie.
+
+
+```{r}
+##  Pronóstico  usando TODA la muestra (2010–2018) y predecir 3 meses mas.
+# extender la serie de desempleo con h NA
+y_ext <- ts(c(as.numeric(y_arima2), rep(NA, h)),  #se crea vector de h (3 en nuestro caso) de na para poner los futuros a pronosticar
+            start = start(y_arima2),
+            frequency = frequency(y_arima2))
+
+# volver a intersectar usando las mismas transformaciones que en data2
+data_ext <- ts.intersect(
+  y_ext, #el que se hizo incluyendo los que van a ser predichos
+  IMAE_5 = stats::lag(imae, -5), 
+  TC_3   = stats::lag(tcF, -3),
+  TBP_3  = stats::lag(tbp, -3),
+  IPC_4  = stats::lag(ipc, -4),
+  ISMR_8 = stats::lag(ismr, -8),
+  dframe = TRUE
+)
+
+
+n_tot <- nrow(data_ext) #numero filas totales con historico y futuro
+X_future <- as.matrix(
+  data_ext[(n_tot - h + 1):n_tot, c("IMAE_5","TC_3","TBP_3","IPC_4","ISMR_8")]
+)
+```
+
+
+```{r}
+fc <- forecast(fit_final2, h = h, xreg = X_future) #ARIMAX(1,0,2)
+
+fc
+autoplot(fc)
+
+```
+Con el modelo arimax(1,0,2) estimado y usando los valores de las variables explicativas se obtienen pronosticos para el periodo nov 2018-enero 2019
+
+# En que medida mejora el pronostico las variables consideradas
+## ARIMA(1,0,2) univariado vs ARIMAX(1,0,2)
+
+
+Los pronosticos fuera de muestra mejoran bastante. Reduccion aproximada del 10.2 % en el RMSE, 17.2 % en el MAE y 19.0 % en el MAPE.
+
+
+## Modelo ARIMAX(0,0,2) con TODA la muestra
+```{r}
+fit_full_002 <- Arima(
+  y_arima2,
+  order = c(0, 0, 2),
+  xreg  = Xreg_arima2,
+  include.mean = TRUE
+)
+
+summary(fit_full_002)
+
+```
+Se estimó el modelo ARIMAX(0,0,2) utilizando la muestra completa de la tasa de
+desempleo en nivel (`y_arima2`) y las covariables rezagadas $IMAE_{t-5}$, $TCF_{t-3}$,
+$TBP_{t-3}$, $IPC_{t-4}$ e $ISMR_{t-8}$. Los coeficientes de los términos MA son elevados
+($ma_1 \approx 0.96$ y $ma_2 \approx 0.79$), lo que indica que la dinámica de corto plazo
+del desempleo está fuertemente determinada por choques en uno y dos meses anteriores. El
+intercepto se sitúa alrededor de 8.68, consistente con el nivel medio de la tasa de
+desempleo en el periodo analizado.
+
+En cuanto a las variables explicativas, $IMAE_{t-5}$, $TBP_{t-3}$, $IPC_{t-4}$ e
+$ISMR_{t-8}$ presentan coeficientes positivos y relativamente precisos, sugiriendo que
+mayores niveles de actividad económica, tasas de interés y salarios mínimos reales se
+asocian con un aumento de la tasa de desempleo una vez descontada la dinámica propia de
+la serie. El tipo de cambio real $TCF_{t-3}$ aparece con un coeficiente negativo,
+lo que apunta a que una apreciación (menor tipo de cambio) tendería a aumentar el
+desempleo, mientras que una depreciación estaría asociada con menores tasas de
+desempleo, aunque la interpretación económica de este efecto debe tomarse con cautela.
+
+El error residual del modelo es moderado ($\sigma^2 \approx 0.089$), con medidas de
+precisión en la muestra completa de $\text{RMSE}\approx 0.28$, $\text{MAE}\approx 0.22$
+y $\text{MAPE}\approx 2.3\%$. En conjunto, el ARIMAX(0,0,2) ajustado sobre toda la
+muestra describe razonablemente bien la evolución de la tasa de desempleo en nivel y
+permite generar pronósticos de corto plazo coherentes con el comportamiento histórico de
+la serie.
+
+
+```{r}
+
+y_ext <- ts(c(as.numeric(y_arima2), rep(NA, h)),
+            start = start(y_arima2),
+            frequency = frequency(y_arima2))
+
+# volver a intersectar usando las mismas transformaciones que en data2
+data_ext <- ts.intersect(
+  y_ext,
+  IMAE_5 = stats::lag(imae, -5), 
+  TC_3   = stats::lag(tcF, -3),
+  TBP_3  = stats::lag(tbp, -3),
+  IPC_4  = stats::lag(ipc, -4),
+  ISMR_8 = stats::lag(ismr, -8),
+  dframe = TRUE
+)
+
+n_tot <- nrow(data_ext)
+X_future <- as.matrix(
+  data_ext[(n_tot - h + 1):n_tot, c("IMAE_5","TC_3","TBP_3","IPC_4","ISMR_8")]
+)
+
+fc_002 <- forecast(fit_full_002, h = h, xreg = X_future)
+
+fc_002
+autoplot(fc_002)
+
+
+```
+Ahora vamos a proseguir con la sugerencia del profe de hacer un test- train del pronostico con un horizontes mas largo 
+
+##Nuevo esquema train–test con corte en mayo 2018
+```{r}
+#Corte: hasta mayo 2018 entrenamos
+y_train_may <- window(y_arima2, end = c(2018, 5)) # desde el inicio hasta mayo 2018, por eso el 5
+y_test_may  <- window(y_arima2, start = c(2018, 6)) # desde junio 2018 hasta el final de la serie
+
+n_total_may  <- length(y_arima2)
+n_train_may  <- length(y_train_may)
+n_test_may   <- length(y_test_may)
+
+n_total_may; n_train_may; n_test_may
+
+# Como Xreg_arima2 es matriz y esta alineada con y_arima2 la cortamos por indices:
+X_train_may <- Xreg_arima2[1:n_train_may, , drop = FALSE]
+X_test_may  <- Xreg_arima2[(n_train_may + 1):n_total_may, , drop = FALSE]
+
+```
+##Ajustamos ARIMAX(1,0,2) con train hasta mayo 2018 y testear
+
+```{r}
+fit_102_may <- Arima(
+  y_train_may,
+  order = c(1, 0, 2),
+  xreg  = X_train_may,
+  include.mean = TRUE
+)
+
+summary(fit_102_may)
+
+h_test_may <- length(y_test_may) ## Pronóstico en todo el tramo de test (jun 2018 - fin)
+
+fc_102_test_may <- forecast(
+  fit_102_may,
+  h    = h_test_may,
+  xreg = X_test_may
+)
+
+acc_102_may <- accuracy(fc_102_test_may, y_test_may)[2, c("RMSE","MAE","MAPE")]
+acc_102_may
+
+```
+Al ajustar el modelo ARIMAX(1,0,2) sólo con la información hasta mayo de 2018 los coeficientes AR y MA resultan moderados: el término autorregresivo es \(\phi_1 \approx 0.15\) y los términos de media móvil son \(\theta_1 \approx 0.91\) y \(\theta_2 \approx 0.79\). Esto indica una dinámica de corto plazo bastante fuerte en los errores (parte MA), mientras que la dependencia puramente AR es más suave. El intercepto ronda \(8.63\), coherente con un nivel medio de desempleo cercano a ese valor en el periodo de entrenamiento.
+
+En cuanto a las covariables, los errores estándar muestran que el efecto más claro sigue siendo el del \(IPC_{t-4}\), mientras que \(IMAE_{t-5}\), \(TC_{t-3}\), \(TBP_{t-3}\) e \(ISMR_{t-8}\) tienen coeficientes relativamente pequeños y con mayor incertidumbre (no todos son estadísticamente significativos al 5 %). Es decir, las variables explicativas aportan información, pero el componente ARMA sigue jugando un papel importante en la dinámica de la serie.
+
+En términos de ajuste, el modelo logra en el tramo de entrenamiento un RMSE ≈ 0.28, MAE ≈ 0.21 y MAPE ≈ 2.2 %, lo que indica un buen desempeño in–sample. Cuando se evalúa en el periodo de prueba ampliado  junio 2018–enero 2019, los errores aumentan como es de esperar fuera de muestra a un RMSE ≈ 0.60, MAE ≈ 0.48 y MAPE ≈ 4.8 %. Esto sugiere que el modelo sigue siendo razonablemente preciso, pero le cuesta más reproducir las oscilaciones del ciclo reciente de desempleo cuando se entrena sólo hasta mayo de 2018, que es precisamente el escenario más exigente propuesto para evaluar su capacidad predictiva.
+
+```{r}
+y_hat_102_all <- ts(
+  c(as.numeric(fitted(fit_102_may)),
+    as.numeric(fc_102_test_may$mean)),
+  start     = start(y_arima2),
+  frequency = frequency(y_arima2)
+)
+
+autoplot(y_arima2, series = "Observado") +
+  autolayer(y_hat_102_all,
+            series = "Pronóstico ARIMAX(1,0,2)",
+            linetype = "dashed") +
+  geom_vline(
+    xintercept = 2018 + (5 - 1) / 12,  # mayo 2018 como corte
+    linetype   = "dotted",
+    colour     = "red"
+  ) +
+  labs(
+    x     = "Tiempo",
+    y     = "Tasa de desempleo",
+    title = "Entrenamiento hasta mayo 2018 y prueba junio 2018–enero 2019 (ARIMAX(1,0,2))"
+  ) +
+  theme_minimal()
+
+```
+
+Visualmente, el modelo reproduce bastante bien el comportamiento histórico durante el tramo de entrenamiento: sigue de cerca el nivel y las oscilaciones de la serie. En el periodo de prueba el pronóstico logra captar la tendencia general y el ciclo del desempleo en la segunda mitad de 2018: anticipa la caída y posterior recuperación, aunque tiende a suavizar los extremos, subestimando ligeramente los picos de desempleo y sobrestimando algunos valles. Aun así, las trayectorias observada y pronosticada se mueven de forma muy similar, lo que indica que el modelo tiene una capacidad razonable para proyectar la dinámica de corto plazo de la tasa de desempleo cuando se calibra sólo con datos hasta mayo de 2018.
+(razonable? bueno creo que subjetivo pero luego vemos mas a detalle la interpretacion)
+
+
+
+
+##Ajustamos ARIMAX(0,0,2) con train hasta mayo 2018 y testear
+```{r}
+fit_002_may <- Arima(
+  y_train_may,
+  order = c(0, 0, 2),
+  xreg  = X_train_may,
+  include.mean = TRUE
+)
+
+summary(fit_002_may)
+
+fc_002_test_may <- forecast(
+  fit_002_may,
+  h    = h_test_may,
+  xreg = X_test_may
+)
+
+acc_002_may <- accuracy(fc_002_test_may, y_test_may)[2, c("RMSE","MAE","MAPE")]
+acc_002_may
+```
+Al ajustar el modelo ARIMAX(0,0,2) sobre el conjunto de entrenamiento hasta mayo de 2018,  se obtiene un proceso puramente de media móvil de orden 2. Los parámetros estimados son \(\theta_1 \approx 0.97\) y \(\theta_2 \approx 0.79\), lo que indica que los shocks de corto plazo tienen un efecto fuerte y persistente sobre la tasa de desempleo: los errores de uno y dos meses atrás se acumulan de forma importante en la dinámica de la serie. El intercepto se sitúa alrededor de \(8.58\), consistente con un nivel medio de desempleo cercano a ese valor en el periodo de entrenamiento.
+
+En cuanto a las covariables, el coeficiente de \(IMAE_{t-5}\) es muy pequeño, mientras que \(TBP_{t-3}\), \(IPC_{t-4}\) e \(ISMR_{t-8}\) muestran efectos positivos moderados (con errores estándar relativamente bajos), y el tipo de cambio \(TC_{t-3}\) aparece con un efecto negativo. En conjunto, esto sugiere que las variables explicativas aportan información sobre el nivel de desempleo, pero la mayor parte de la dinámica de corto plazo sigue capturada por la parte MA del modelo.
+
+El desempeño en el tramo de entrenamiento es razonablemente bueno, con **RMSE ≈ 0.28**, **MAE ≈ 0.22** y **MAPE ≈ 2.2 %**, lo que indica que el modelo ajusta bien los datos históricos. Al evaluarlo en el periodo de prueba ampliado **junio 2018–enero 2019**, los errores aumentan como es esperable fuera de muestra a **RMSE ≈ 0.62**, **MAE ≈ 0.49** y **MAPE ≈ 5.0 %**. Esto muestra que el modelo mantiene una capacidad predictiva razonable, aunque la incertidumbre crece cuando se proyecta sobre el ciclo reciente de desempleo sin haberlo utilizado en el entrenamiento.
+
+
+```{r}
+y_hat_002_all <- ts(
+  c(as.numeric(fitted(fit_002_may)), as.numeric(fc_002_test_may$mean)),
+  start     = start(y_arima2),
+  frequency = frequency(y_arima2)
+)
+
+autoplot(y_arima2, series = "Observado") +
+  autolayer(y_hat_002_all, series = "Pronóstico ARIMAX(0,0,2)", linetype = "dashed") +
+  geom_vline(xintercept = 2018 + (5 - 1) / 12,  # mayo 2018 como corte
+             linetype = "dotted", colour = "red") +
+  labs(
+    x = "Tiempo", y = "Tasa de desempleo",
+    title = "Entrenamiento hasta mayo 2018 y prueba junio 2018–enero 2019"
+  ) +
+  theme_minimal()
+```
+
+Comportamiento del modelo ARIMAX(0,0,2) entrenado hasta mayo de 2018 y evaluado en el periodo de prueba junio 2018–enero 2019. La línea roja muestra la tasa de desempleo observada y la línea celeste punteada el pronóstico del modelo; la línea vertical punteada marca el punto de corte entre entrenamiento y prueba. Durante el tramo de entrenamiento, el modelo sigue de cerca el nivel y las oscilaciones de la serie, reproduciendo bien los principales picos y valles, aunque con una ligera suavización de los extremos. En el tramo de prueba, el ARIMAX(0,0,2) logra capturar razonablemente el ciclo reciente del desempleo: anticipa la caída y posterior aumento hacia finales de 2018, pero tiende a subestimar los valores más altos y a sobreestimar algunos mínimos, lo que se refleja en errores fuera de muestra mayores que en el entrenamiento (MAPE cercano al 5 %). En conjunto, la figura sugiere que un modelo con sólo componente MA en los errores y covariables macroeconómicas es capaz de replicar la forma general de la serie, pero con cierta pérdida de precisión en el nivel exacto del desempleo en los meses más volátiles.
+
+## Vamos a intentar buscar otro modelo para esa fecha de corte 
+
+```{r}
+#creo que los modelos de aqui no estan dando muy bien entonces se puede ignorar o no se, tal vez alguien le sepa mas al analisis de residuos que yo y el auto.arima 
+
+## Corte en mayo 2018
+cut_may <- c(2018, 5)
+y_may    <- window(y,    end = cut_may)   # tasa de desempleo en nivel
+imae_may <- window(imae, end = cut_may)
+tcF_may  <- window(tcF,  end = cut_may)
+tbp_may  <- window(tbp,  end = cut_may)
+ipc_may  <- window(ipc,  end = cut_may)
+ismr_may <- window(ismr, end = cut_may)
+
+#misma lógica que data2 pero cortado
+data_may <- ts.intersect(
+  y      = y_may,
+  IMAE_5 = stats::lag(imae_may, -5),
+  TC_3   = stats::lag(tcF_may,  -3),
+  TBP_3  = stats::lag(tbp_may,  -3),
+  IPC_4  = stats::lag(ipc_may,  -4),
+  ISMR_8 = stats::lag(ismr_may, -8),
+  dframe = TRUE
+)
+
+head(data_may)
+#estamos cortando
+```
+
+
+```{r}
+#Regresio lineal hasta mayo 2018
+fit_reg_may <- lm(
+  y ~ IMAE_5 + TC_3 + TBP_3 + IPC_4 + ISMR_8,
+  data      = data_may,
+  na.action = NULL
+)
+summary(fit_reg_may)
+
+
+res_may <- residuals(fit_reg_may)
+
+#Diagnostico de residuos
+tsdisplay(res_may, main = "Residuos regresión (hasta mayo 2018)")
+Box.test(res_may, lag = 12, type = "Ljung")
+
+```
+ACF: El lag 1 es grande y positivo  y luego las autocorrelaciones van decayendo de forma suave 
+PACF:Pico fuerte en lag 1, alo sumo un pequeño pico en lag 2, los demas van decayendo a 0
+Parace un arimax(1,0,0) pero como eso da el auto.arima vamos a considerar probar ARIMAX(2,0,0) por si ese residuo en 2 del pacf fuera importante 
+
+
+
+
+```{r}
+# auto.arima sobre los residuos 
+auto_res_may <- auto.arima(res_may, seasonal = FALSE)
+summary(auto_res_may)
+
+res_auto_may <- residuals(auto_res_may)
+
+tsdisplay(
+  res_auto_may,
+  main = "Residuos del modelo ARIMA(1,0,0) por auto.arima"
+)
+
+
+```
+
+##Pronosticos con ARIMAX(2,0,0) y ARIMAX(1,0,0) para la nueva fecha de corte(mayo 2018)
+
+### ARIMAX(2,0,0), corte mayo 2018
+
+```{r}
+# ya teniamos los conjuntos de entrenamiento y etc entonces no los volvimos a escribir
+#estos pronosticos no estan comentados porque me parece que no esta dando muy bien las metricas y proyecciones visuales :)
+fit_200_may <- Arima(
+  y_train_may,
+  order = c(2, 0, 0),
+  xreg  = X_train_may,
+  include.mean = TRUE
+)
+
+summary(fit_200_may)
+
+```
+```{r}
+#Pronóstico en el tramo de test (jun 2018 – ene 2019)
+h_test_may <- length(y_test_may)
+
+fc_200_test_may <- forecast(
+  fit_200_may,
+  h    = h_test_may,
+  xreg = X_test_may
+)
+```
+
+
+```{r}
+acc_200_may <- accuracy(fc_200_test_may, y_test_may)[2, c("RMSE","MAE","MAPE")]
+acc_200_may
+
+```
+
+```{r}
+yhat_200_may <- ts(
+  c(fitted(fit_200_may), fc_200_test_may$mean),
+  start     = start(y_train_may),
+  frequency = frequency(y_arima2)
+)
+
+
+ts_plot_200 <- cbind(
+  Observado             = window(y_arima2,
+                                 start = start(y_train_may)),
+  `Pronóstico ARIMAX(2,0,0)` = yhat_200_may
+)
+
+cut_time_may <- 2018 + 5/12
+
+autoplot(ts_plot_200) +
+  geom_vline(xintercept = cut_time_may,
+             linetype = "dashed", colour = "red") +
+  labs(
+    title = "Entrenamiento hasta mayo 2018 y prueba junio 2018–enero 2019 (ARIMAX(2,0,0))",
+    x = "Tiempo",
+    y = "Tasa de desempleo"
+  ) +
+  theme_minimal()
+
+```
+no vamos a considerar estas pruebas extras 
+###ARIMAX(1,0,0) corte mayo 2018
+```{r}
+
+fit_100_may <- Arima(
+  y_train_may,
+  order = c(1, 0, 0),
+  xreg  = X_train_may,
+  include.mean = TRUE
+)
+
+summary(fit_100_may)
+
+```
+
+```{r}
+# Pronostico en el tramo de test (jun 2018 – ene 2019)
+h_test_may <- length(y_test_may)
+
+fc_100_test_may <- forecast(
+  fit_100_may,
+  h    = h_test_may,
+  xreg = X_test_may
+)
+
+acc_100_may <- accuracy(fc_100_test_may, y_test_may)[2, c("RMSE","MAE","MAPE")]
+acc_100_may
+
+```
+
+```{r}
+
+yhat_100_may <- ts(
+  c(fitted(fit_100_may), fc_100_test_may$mean),
+  start     = start(y_train_may),
+  frequency = frequency(y_arima2)
+)
+
+ts_plot_100 <- cbind(
+  Observado              = window(y_arima2,
+                                  start = start(y_train_may)),
+  `Pronóstico ARIMAX(1,0,0)` = yhat_100_may
+)
+
+cut_time_may <- 2018 + 5/12  
+
+autoplot(ts_plot_100) +
+  geom_vline(xintercept = cut_time_may,
+             linetype = "dashed", colour = "red") +
+  labs(
+    title = "Entrenamiento hasta mayo 2018 y prueba junio 2018–enero 2019 (ARIMAX(1,0,0))",
+    x = "Tiempo",
+    y = "Tasa de desempleo"
+  ) +
+  theme_minimal()
+
+```
+
+## Pronostico movil
+
+```{r}
+tiempos <- time(y_arima2)
+idx_may <- which(floor(tiempos) == 2018 & cycle(y_arima2) == 5) #indice de mayo de 2018 en y_arima2
+
+tiempos[idx_may]  # debe imprimir algo como 2018.333 y en efecto 
+
+```
+
+```{r}
+# Paso1: ARIMAX(1,0,2) con datos hasta mayo-2018 y pronóstico junio-2018.
+# Paso2: re-estimo el modelo con datos hasta junio-2018 y pronóstico julio-2018.
+# Y así hasta tener pronósticos uno a uno (idealmente 9, si hay datos suficientes).
+
+tiempos <- time(y_arima2)
+
+idx_may <- which(floor(tiempos) == 2018 & cycle(y_arima2) == 5) # indice de mayo 2018 en la serie alineada, otra vez por si acaso
+
+n <- length(y_arima2)
+
+# máximo número de pasos que puedo dar sin salirme del ts
+H_max <- n - idx_may          # desde junio 2018 hasta el último dato disponible
+H     <- min(9, H_max)        # queremos 9, pero no más de lo que hay en la serie, para solucionar el error 
+
+H
+y_hat_dyn <- numeric(H)       # aqui guardamos los H pronósticos 1-paso
+
+for (k in 1:H) {
+  # en el paso k, el fin del tramo de entrenamiento es este índice
+  idx_end <- idx_may + k - 1
+  
+  # serie de desempleo hasta ese mes
+  y_train_k <- window(y_arima2, end = tiempos[idx_end])
+  
+  # regresores hasta ese mes (misma longitud)
+  X_train_k <- Xreg_arima2[1:idx_end, , drop = FALSE]
+  
+  # ajustamos ARIMAX(1,0,2)
+  fit_k <- Arima(
+    y_train_k,
+    order = c(1, 0, 2),
+    xreg  = X_train_k,
+    include.mean = TRUE
+  )
+  
+  # regresores del mes que queremos pronosticar (1 paso adelante)
+  X_fc_k <- Xreg_arima2[idx_end + 1, , drop = FALSE]
+  
+  # pronóstico a 1 paso
+  fc_k <- forecast(fit_k, h = 1, xreg = X_fc_k)
+  y_hat_dyn[k] <- as.numeric(fc_k$mean)
+}
+
+# convertir los pronósticos a ts: empiezan en el mes siguiente a mayo 2018
+start_fc_time <- tiempos[idx_may + 1]
+start_year    <- floor(start_fc_time)
+start_month   <- cycle(y_arima2)[idx_may + 1]
+
+y_hat_dyn_ts <- ts(
+  y_hat_dyn,
+  start     = c(start_year, start_month),  # en tu caso debería ser (2018, 6)
+  frequency = frequency(y_arima2)
+)
+
+y_hat_dyn_ts
+
+```
+modelo ARIMAX(1,0,2) implementamos un esquema de pronóstico dinámico. Fijamos un horizonte \(H = 5\) meses (junio–octubre de 2018) y, para cada \(k = 1,\dots,H\), integument–estimamos el modelo con la información disponible hasta el mes \(t_k\) (mayo 2018 para \(k=1\), junio 2018 para \(k=2\), etc.) y pronosticamos únicamente un paso adelante, utilizando los regresores correspondientes al mes siguiente. 
+
+De esta forma obtenemos una secuencia de cinco pronósticos un–paso–adelante:
+Jun-2018 \(\approx 8{,}79\), Jul-2018 \(\approx 9{,}03\), Ago-2018 \(\approx 9{,}01\), Sep-2018 \(\approx 9{,}44\) y
+Oct-2018 \(\approx 10{,}46\). Cada valor representa la tasa de desempleo pronosticada para ese mes
+bajo un esquema en el que el modelo se actualiza mensualmente conforme llegan nuevos datos.
+
+Llegamos hasta H=5 porque con los objetos que estamos usando (y_arima2 y Xreg_arima2), la longitud de la serie alineada sólo llega 5 meses después de mayo-2018. A partir de ahí ya no tenemos observaciones simultáneas de desempleo y de todos los regresores rezagados de modo que no es posible seguir generando pronósticos un paso adelante sin extrapolar las variables explicativas
+
+```{r}
+autoplot(window(y_arima2, start = c(2017, 1))) +
+  autolayer(y_hat_dyn_ts, series = "Pronóstico dinámico (1 paso)",
+            linetype = "dashed") +
+  geom_vline(xintercept = tiempos[idx_may],
+             linetype = "dotted", colour = "red") +
+  labs(
+    title = "Pronóstico dinámico 1-paso (ARIMAX(1,0,2))",
+    x = "Tiempo", y = "Tasa de desempleo"
+  ) +
+  theme_minimal()
+
+
+```
+
+
+
+
+
+
+
+
+```{r}
+start_year  <- start(y_hat_dyn_ts)[1] # Valores observados en el mismo período que los pronósticos dinámicos
+start_month <- start(y_hat_dyn_ts)[2]
+end_time    <- time(y_hat_dyn_ts)[length(y_hat_dyn_ts)]
+end_year    <- floor(end_time)                              
+end_month   <- cycle(y_hat_dyn_ts)[length(y_hat_dyn_ts)]
+
+y_test_dyn <- window(
+  y_arima2,
+  start = c(start_year, start_month),
+  end   = c(end_year, end_month)
+)
+
+acc_dyn <- accuracy(y_hat_dyn_ts, y_test_dyn)[1, c("RMSE", "MAE", "MAPE")] # Metricas de error del pronóstico dinamico de 1 paso
+acc_dyn
+
+```
+
+Siguiendo la sugerencia del profesor, implementamos un esquema de pronóstico dinámico a corto plazo con el modelo ARIMAX(1,0,2). Fijamos un corte en mayo de 2018 y, a partir de ese punto, procedimos de la siguiente forma:
+
+1. En el primer paso, se estimó el ARIMAX(1,0,2) utilizando únicamente la información disponible hasta mayo de 2018 y se generó un pronóstico de un paso adelante para junio de 2018.
+2. En el segundo paso, se reestimó el modelo incorporando el valor observado de la  tasa de desempleo de junio de 2018, y se pronosticó julio de 2018.
+3. Este procedimiento se repitió de manera iterativa, siempre re-entrenando el modelo con toda la información disponible hasta el mes anterior y produciendo un pronóstico de un mes adelante, hasta obtener una trayectoria de H meses (idealmente 9, aproximadamente un 10 % de la muestra creo, segun lo que dijo el profe).
+De este modo se obtiene una secuencia de pronósticos de un paso adelante encadenados
+entre junio de 2018 y febrero de 2019, que permite evaluar si el modelo es capaz de
+reproducir el ciclo completo de subida y bajada de la tasa de desempleo durante ese
+periodo. El pronóstico dinámico a 5 meses es  bastante preciso: 
+el RMSE es aproximadamente \(0.386\), el MAE ronda \(0.294\) y el MAPE se sitúa cerca de \(3.07\%\)..
+ y sigue razonablemente bien
+la caída y posterior recuperación de la tasa de desempleo, aunque, como es habitual,
+tiende a suavizar los extremos más pronunciados. Este experimento complementa el
+análisis train–test anterior y muestra que el ARIMAX(1,0,2) mantiene una capacidad
+predictiva aceptable cuando se utiliza en un entorno operativo en el que el modelo se
+actualiza mes a mes con la información más reciente.
+
+
+```{r}
+
+y_train <- window(y_arima2, end = tiempos[idx_may])
+X_train <- Xreg_arima2[1:idx_may, , drop = FALSE]
+
+# Ajuste ARIMAX(1,0,2) solo en el train
+fit_train_dyn <- Arima(
+  y_train,
+  order = c(1, 0, 2),
+  xreg  = X_train,
+  include.mean = TRUE
+)
+
+summary(fit_train_dyn)
+
+# Medidas de error en TRAIN (como en los ejemplos del profe)
+acc_train_dyn <- accuracy(fit_train_dyn)
+acc_train_dyn
+
+```
+
+
+```{r}
+
+rmse_train_dyn <- acc_train_dyn["Training set","RMSE"]
+mae_train_dyn  <- acc_train_dyn["Training set","MAE"]
+mape_train_dyn <- acc_train_dyn["Training set","MAPE"]
+
+c(RMSE = rmse_train_dyn,
+  MAE  = mae_train_dyn,
+  MAPE = mape_train_dyn)
+
+```
+
+
+
+```{r}
+rmse_test_dyn <- acc_dyn["Test set","RMSE"]
+mae_test_dyn  <- acc_dyn["Test set","MAE"]
+mape_test_dyn <- acc_dyn["Test set","MAPE"]
+
+res_arimax_dyn <- data.frame(
+  muestra = c("Train", "Test dinámico (h = 1)"),
+  RMSE    = c(rmse_train_dyn, rmse_test_dyn),
+  MAE     = c(mae_train_dyn,  mae_test_dyn),
+  MAPE    = c(mape_train_dyn, mape_test_dyn)
+)
+
+res_arimax_dyn
+```
+
+En el tramo de entrenamiento el ARIMAX(1,0,2) presenta un RMSE de 0.28, MAE de 0.21 y MAPE cercano al 2.2 %, lo que indica un buen ajuste in-sample. En el esquema de pronóstico dinámico 1-paso (test de 5 meses) los errores aumentan a un RMSE de 0.39 y MAE de 0.29, con MAPE ≈ 3.1 %. Aunque el desempeño es algo peor fuera de muestra, los errores siguen siendo relativamente pequeños (por debajo de 0.4 puntos porcentuales de la tasa de desempleo), lo que sugiere que el modelo mantiene una capacidad de pronóstico razonable en el corto plazo.
+```{r}
+y_plot <- window(y_arima2, start = c(2017, 1))
+
+autoplot(y_plot, series = "Observado") +
+  autolayer(y_hat_dyn_ts,
+            series   = "Pronóstico dinámico (1 paso)",
+            linetype = "dashed") +
+  geom_vline(xintercept = tiempos[idx_may],
+             linetype = "dotted", colour = "red") +
+  labs(
+    title    = "Pronóstico dinámico 1-paso (ARIMAX(1,0,2))",
+    subtitle = "Línea roja: corte en mayo-2018 (fin del train)",
+    x = "Tiempo", y = "Tasa de desempleo"
+  ) +
+  theme_minimal()
+```
+
+
+
+
+
+
+
+```{r}
+# En que medida mejora el pronostico las variables consideradas
+
+
+#Particion train test
+n       <- length(y_arima2)
+n_train <- floor(0.8 * n)
+tiempos <- time(y_arima2)
+
+y_train <- window(y_arima2, end   = tiempos[n_train])
+y_test  <- window(y_arima2, start = tiempos[n_train + 1])
+
+X_train <- Xreg_arima2[1:n_train, ]
+X_test  <- Xreg_arima2[(n_train + 1):n, ]
+
+#Modelo base: ARIMA(1,0,2) sin covariables
+fit_uni_tr    <- Arima(y_train, order = c(1,0,2), include.mean = TRUE)
+fc_uni_test   <- forecast(fit_uni_tr, h = length(y_test))
+acc_uni_test  <- accuracy(fc_uni_test, y_test)
+
+acc_uni_test  # aqui el RMSE, MAE, MAPE del test set para el ARIMA solo
+
+#Modelo completo: ARIMAX(1,0,2) con todas las X
+fit_arimax_tr   <- Arima(y_train, order = c(1,0,2),
+                         xreg = X_train, include.mean = TRUE)
+fc_arimax_test  <- forecast(fit_arimax_tr, h = length(y_test), xreg = X_test)
+acc_arimax_test <- accuracy(fc_arimax_test, y_test)
+
+acc_arimax_test # aqui los errores del test set para el ARIMAX completo
+
+#estos chunks se estan haciendo porque se ocupa como base para comparar, luego se hizo de mannera mas optimizada pero son importantes 
+```
+
+
+```{r}
+# % de mejora
+rmse_uni_test    <- acc_uni_test["Test set", "RMSE"]
+rmse_arimax_test <- acc_arimax_test["Test set", "RMSE"]
+
+mae_uni_test     <- acc_uni_test["Test set", "MAE"]
+mae_arimax_test  <- acc_arimax_test["Test set", "MAE"]
+
+mape_uni_test    <- acc_uni_test["Test set", "MAPE"]
+mape_arimax_test <- acc_arimax_test["Test set", "MAPE"]
+
+mejora_rmse_test <- 100 * (rmse_uni_test  - rmse_arimax_test) / rmse_uni_test
+mejora_mae_test  <- 100 * (mae_uni_test   - mae_arimax_test)  / mae_uni_test
+mejora_mape_test <- 100 * (mape_uni_test  - mape_arimax_test) / mape_uni_test
+
+mejora_rmse_test
+mejora_mae_test
+mejora_mape_test
+
+```
+Mejora global ARIMA vs ARIMAX 
+Los pronosticos fuera de muestra mejoran bastante. Reduccion aproximada del 10.2 % en el RMSE, 17.2 % en el MAE y 19.0 % en el MAPE.
+
+
+```{r}
+#Funcion general para evaluar ARIMAX en train/test, se va a estar usando entonces no borrar 
+
+eval_arimax_test <- function(y, X, order = c(1,0,2), train_frac = 0.8) { #80-20
+  n <- length(y)
+  n_train <- floor(train_frac * n)
+  tiempos <- time(y)
+  
+  # dividir y
+  y_train <- window(y, end   = tiempos[n_train])
+  y_test  <- window(y, start = tiempos[n_train + 1])
+  
+  # dividir X (mismas filas)
+  X_train <- X[1:n_train, , drop = FALSE]
+  X_test  <- X[(n_train + 1):n, , drop = FALSE]
+  
+  # ajustar y pronosticar
+  fit <- Arima(y_train, order = order, xreg = X_train, include.mean = TRUE)
+  fc  <- forecast(fit, h = length(y_test), xreg = X_test)
+  
+  acc <- accuracy(fc, y_test)
+  # devolvemos solo el test set y columnas clave, metricas 
+  out <- acc["Test set", c("RMSE", "MAE", "MAPE")]
+  return(out)
+}
+
+```
+
+
+
+##Modelo completo
+
+```{r}
+# y_arima2: desempleo alineado
+# Xreg_arima2: IMAE_5, TC_3, TBP_3, IPC_4, ISMR_8
+vars <- colnames(Xreg_arima2)
+vars
+full_perf <- eval_arimax_test(y_arima2, Xreg_arima2)
+full_perf
+
+
+```
+Primero evaluamos el modelo ARIMAX(1,0,2) COMPLETO, que incluye como regresores
+el IMAE rezagado cinco meses \((IMAE_{t-5})\), el tipo de cambio \((TC_{t-3})\) rezagado tres meses, la TBP rezagada tres meses\((TBP_{t-3})\), el IPC \((IPC_{t-4})\) y el índice de salarios mínimos
+reales \((ISMR_{t-8})\).
+
+Se divide la muestra en un 80 % para training y un 20 % para test, se ajusta el ARIMAX(1,0,2) en el tramo de entrenamiento y calcula los errores de pronóstico (RMSE, MAE y MAPE) en el tramo de prueba.
+Desempeño del modelo completo en el conjunto de prueba:
+RMSE = 0.543, MAE = 0.441 y MAPE =4.70 %.  
+Esps valores son la referencia para comparar modelos reducidos en los siguientes pasos.
+
+
+
+## Aportes marginales 
+```{r}
+#Entre mas empeore, mas importante es esa variable para predecir.
+
+results_drop <- list()
+
+for (v in vars) {
+  X_sub <- Xreg_arima2[, setdiff(vars, v), drop = FALSE]  # todas menos v, mas rapidito
+  perf  <- eval_arimax_test(y_arima2, X_sub)
+  results_drop[[v]] <- perf
+}
+
+# Pasar a data.frame bonito
+drop_df <- do.call(rbind, results_drop)
+rownames(drop_df) <- paste0("Sin_", vars)
+drop_df
+
+
+#recordemos lo de arriba que era el completo con este comparamos lo que nos de el output:
+#
+#       RMSE      MAE    MAPE
+# 0.5426308 0.4412843 4.7016466
+```
+Quitar el IMAE casi no cambia el pronóstico, el tipo de cambio también tiene un efecto muy pequeño en el error de pronóstico. 
+Quitar la TBP empeora bastante los errores entonces TBP es importante para predecir y el índice de salarios mínimos reales también es clave para el pronóstico.
+Sin IPC los errores  mejoran un poquito entonces el IPC aporta muy poco o introduce algo de ruido.
+```{r}
+# repetir full_perf a mismo numero de filas
+full_mat <- matrix(rep(as.numeric(full_perf), each = nrow(drop_df)),
+                   ncol = 3, byrow = FALSE)
+colnames(full_mat) <- colnames(full_perf)
+rownames(full_mat) <- rownames(drop_df)
+
+# % de deterioro al quitar cada variable
+empeora_pct <- 100 * (drop_df - full_mat) / full_mat
+empeora_pct
+
+```
+#aca se concluye lo mismo que arriba pero visto porcentualmente
+
+Para evaluar el aporte marginal de cada covariable dentro del modelo completo, se
+estimaron modelos ARIMAX(1,0,2) eliminando una variable a la vez y se calculó el
+porcentaje de deterioro de los errores fuera de muestra (RMSE, MAE, MAPE) respecto al
+modelo con todas las regresoras. Entre más aumentan los errores al quitar una variable,
+mayor es su importancia para el pronóstico.
+
+Los resultados muestran que remover $IMAE_{t-5}$ o el tipo de cambio apenas modifica los
+errores (variaciones menores al 0.3 %), por lo que su contribución marginal es muy
+limitada. Al excluir el $IPC_{t-4}$, el RMSE incluso disminuye alrededor de 1.5 %, lo que
+sugiere que esta variable es prácticamente redundante una vez que se controlan las demás
+covariables.
+
+En contraste, al eliminar la $TBP_{t-3}$ o el índice de salarios mínimos reales
+$ISMR_{t-8}$, el RMSE aumenta cerca de 1.6–1.7 %, mientras que el MAE y el MAPE se
+incrementan alrededor de 5–6 %. Esto indica que la TBP y el ISMR son las covariables que
+más contribuyen a reducir el error de pronóstico dentro del modelo ARIMAX considerado.
+
+
+
+##Una variable a la vez 
+```{r}
+#recordemos los errores que salen de test set del arima sin covariables o sea el modelo base para poder hacer la comparacion de como se ve ese modelo con una de las variables 
+acc_uni_test["Test set", c("RMSE","MAE","MAPE")]
+
+```
+
+
+```{r}
+#Antes ibamos viendo el modelo completo - una variable(efectos marginales), aca mas bien vamos viendo la base y con una variable a la vez 
+results_single <- list() #modelos ARIMAX(1,0,2) con solo una X a la vez
+
+for (v in vars) {
+  X_single <- Xreg_arima2[, v, drop = FALSE]
+  perf  <- eval_arimax_test(y_arima2, X_single)
+  results_single[[v]] <- perf
+}
+
+single_df <- do.call(rbind, results_single)
+rownames(single_df) <- paste0("Solo_", vars)
+single_df
+
+```
+Interpretación variable por variable, comparando contra el base:
+
+El IMAE, por si solo, casi no mejora el pronotico. 
+
+El tipo de cambio solo no ayuda a predecir mejor de hecho, los errores fuera de muestra aumentan ligeramente:
+RMSE: 0.6070 (vs 0.6032)
+
+MAE: 0.5357 (vs 0.5328)
+
+MAPE: 5.84 % (vs 5.80 %)
+
+LA TBP SOLA REDUCE de forma importante los errores de pronóstico,ES UNA DE LAS COVARIABLES CON MAYOR PODER PREDICTIVa SOBRE EL DESEMPLEO:
+RMSE: 0.5458 (vs 0.6032)
+
+MAE: 0.4613 (vs 0.5328)
+
+MAPE: 4.96 % (vs 5.80 %)
+
+IPC tambien mejora de manera apreciable el pronóstico cuando se usa como unica variable explicativa
+
+El índice de salarios mínimos reales por si solo tambien contribuye a reducir los errores, aunque menos que la TBP y el IPC
+
+
+```{r}
+#ocupo esto para ver que tanto mejora vs ARIMA univariado necesitamos tambien el desempeño del ARIMA sin X en test
+
+# modelo solo ARIMA en test
+eval_arima_test <- function(y, order = c(1,0,2), train_frac = 0.8) {
+  n <- length(y)
+  n_train <- floor(train_frac * n)
+  tiempos <- time(y)
+  
+  y_train <- window(y, end   = tiempos[n_train])
+  y_test  <- window(y, start = tiempos[n_train + 1])
+  
+  fit <- Arima(y_train, order = order, include.mean = TRUE)
+  fc  <- forecast(fit, h = length(y_test))
+  
+  acc <- accuracy(fc, y_test)
+  acc["Test set", c("RMSE", "MAE", "MAPE")]
+}
+
+base_test <- eval_arima_test(y_arima2) #esto se puede hacer mejor sin repetir de nuevo cosas que ya se hicieron
+#base_test
+```
+
+```{r}
+base_mat <- matrix(rep(as.numeric(base_test), each = nrow(single_df)),
+                   ncol = 3, byrow = FALSE)
+colnames(base_mat) <- colnames(base_test)
+rownames(base_mat) <- rownames(single_df)
+
+mejora_single_pct <- 100 * (base_mat - single_df) / base_mat
+colnames(mejora_single_pct) <- c("RMSE", "MAE", "MAPE")
+mejora_single_pct
+#Lo mismo pero con porcentajes 
+
+```
+Al estimar modelos ARIMAX(1,0,2) con una sola covariable a la vez, se observa que el
+$IMAE_{t-5}$ apenas mejora el pronóstico (≈ 1 %), mientras que el tipo de cambio por sí solo
+incluso empeora ligeramente los errores respecto al ARIMA univariado. En cambio, la
+$TBP_{t-3}$ es la variable individual más informativa: reduce el RMSE, el MAE y el MAPE
+fuera de muestra en aproximadamente un 10–15 %. El $IPC_{t-4}$ y el $ISMR_{t-8}$ también
+contribuyen de forma relevante, con reducciones de entre 5 % y 10 % en los errores de
+pronóstico.
+
+
+
+# Conclusion general:
+
+En conjunto, los resultados indican que las variables macroeconómicas consideradas sí
+aportan información útil para pronosticar la tasa de desempleo. El modelo ARIMAX(1,0,2)
+con todas las regresoras ($IMAE_{t-5}$, $TC_t$, $TBP_{t-3}$, $IPC_{t-4}$, $ISMR_{t-8}$)
+logra reducir los errores de pronóstico fuera de muestra en torno a un 10 % en términos
+de RMSE y alrededor de un 17–19 % en MAE y MAPE con respecto al ARIMA univariado, por lo
+que el uso de covariables mejora de manera clara la precisión del modelo.
+
+Sin embargo, no todas las variables contribuyen por igual. Los resultados muestran que, al eliminar el $IMAE_{t-5}$ o el tipo de cambio, los errores casi
+no cambian, mientras que al remover el $IPC_{t-4}$ el RMSE incluso disminuye ligeramente,
+lo que sugiere que estas tres variables tienen un aporte marginal reducido dentro del
+modelo completo. En contraste, tanto la $TBP_{t-3}$ como el índice de salarios mínimos
+reales $ISMR_{t-8}$ generan aumentos del orden de 5–6 % en MAE y MAPE cuando se excluyen,
+y, analizadas individualmente, son las regresoras que más reducen los errores frente al
+ARIMA sin X. En síntesis, el modelo ARIMAX mejora de forma apreciable el pronóstico de la
+tasa de desempleo y dicha mejora se explica principalmente por la información contenida en
+la TBP y en el ISMR, mientras que el IMAE, el tipo de cambio y el IPC parecen jugar un
+papel secundario en el horizonte y periodo analizados.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
